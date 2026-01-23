@@ -1,0 +1,7 @@
+.venv/
+
+.idea
+
+examples/
+components/
+**/__pycache__/**
