@@ -7,13 +7,12 @@ from pathlib import Path
 from typing import List, Dict, Any, Iterable
 from datetime import datetime, timezone
 
-import numpy as np
-
+from .embedding.http_embedder import HttpEmbedder
 from .schema import Chunk
 from .chunkers.router import ChunkerRouter
 from .chunkers.base import ChunkingConfig
-from .embedder import JinaCodeEmbedder
 from .faiss_db import FaissFlatIP
+
 
 CODE_EXTS = {".py", ".js", ".ts", ".tsx", ".java", ".kt", ".go", ".rs", ".cpp", ".c", ".h", ".cs"}
 TEXT_EXTS = {".md", ".txt", ".rst"}
@@ -234,13 +233,29 @@ def build_packet(
     write_docs_jsonl(chunks, docs_path)
     print(f"[write] docs.jsonl -> {docs_path} ({len(chunks)} lines)")
 
-    # 3) embed
-    embedder = JinaCodeEmbedder(model_name=model_name, max_seq_length=max_seq_length)
-    dim = embedder.dim
-    print(f"[embed] model={model_name}")
-    print(f"[embed] dim={dim} max_seq_length={max_seq_length}")
+    # 3) embed (via HTTP embedding server)
+    embed_url = os.environ.get("RAG_EMBED_URL", "http://127.0.0.1:8765")
+    client = HttpEmbedder(embed_url)
+    if not client.health():
+        print(f"[error] embedding server not reachable at {embed_url}")
+        print("        - start it with: python -m uvicorn rag.embedding_server:app --host 127.0.0.1 --port 8765")
+        print("        - or set RAG_EMBED_URL")
+        return
+
+    print(f"[embed] server={embed_url}")
+    print(f"[embed] model={model_name} max_seq_length={max_seq_length}")
+
     texts = [c.text for c in chunks]
-    vecs = embedder.embed_texts(texts)  # float32, normalized
+    vecs = client.embed_texts(
+        texts,
+        model_name=model_name,
+        max_seq_length=max_seq_length,
+        normalize=True,
+        dtype="float32",
+        show_progress=True,  # build può mostrarla
+    )
+    dim = int(vecs.shape[1])
+    print(f"[embed] dim={dim}")
     print(f"[embed] vectors shape={vecs.shape} dtype={vecs.dtype}")
 
     # 4) faiss index + commit
