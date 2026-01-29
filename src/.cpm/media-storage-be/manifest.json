@@ -30,7 +30,30 @@
     "docs": 35,
     "vectors": 35
   },
+  "source": {
+    "input_dir": "C:/Users/redeg/Documents/Progetti/media-storage-be",
+    "file_ext_counts": {
+      ".md": 1,
+      ".java": 16
+    }
+  },
+  "cpm": {
+    "name": "media-storage-be",
+    "version": "0.0.0",
+    "tags": [
+      "cpm",
+      "docs",
+      "java"
+    ],
+    "entrypoints": [
+      "query"
+    ]
+  },
   "checksums": {
+    "cpm.yml": {
+      "algo": "sha256",
+      "value": "cb26470ce11779385ad2eb477265b723533fc9f1c1e3d67cdb79baec0747dbcc"
+    },
     "docs.jsonl": {
       "algo": "sha256",
       "value": "f82515359c25ac3d41572215a225cc98f9a9011cef75bd9cfdae6d216b147e4e"

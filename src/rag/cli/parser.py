@@ -5,8 +5,19 @@ from .commands.build import (
     cmd_build,
     cmd_cpm_build,
 )
-from .commands.query import cmd_query
 from .commands.lookup import cmd_cpm_lookup
+
+
+def _cmd_packet_query(args):
+    # Lazy import: evita di caricare embedder/transformers quando fai lookup/build
+    from .commands.query import cmd_query
+    return cmd_query(args)
+
+
+def _cmd_cpm_query(args):
+    # Lazy import: stessa logica
+    from .commands.cpm_query import cmd_cpm_query
+    return cmd_cpm_query(args)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -29,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     packet_query.add_argument("--packet_dir", required=True)
     packet_query.add_argument("--query", required=True)
     packet_query.add_argument("-k", type=int, default=5)
-    packet_query.set_defaults(func=cmd_query)
+    packet_query.set_defaults(func=_cmd_packet_query)
 
     # CPM commands
     cpm = sub.add_parser("cpm", help="Context packet manager")
@@ -49,5 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     cpm_lookup.add_argument("--format", choices=["text", "jsonl"], default="text",
                             help="Output format (default: text)")
     cpm_lookup.set_defaults(func=cmd_cpm_lookup)
+
+    # cpm query
+    cpm_query = cpm_sub.add_parser("query", help="Query an installed packet by name/path under .cpm/")
+    cpm_query.add_argument("--cpm_dir", default=".cpm", help="Folder containing extracted packets (default: .cpm)")
+    cpm_query.add_argument("--packet", required=True, help="Packet name (folder), or direct path to packet folder")
+    cpm_query.add_argument("--query", required=True)
+    cpm_query.add_argument("-k", type=int, default=5)
+    cpm_query.set_defaults(func=_cmd_cpm_query)
 
     return ap

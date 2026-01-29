@@ -1,10 +1,7 @@
-import argparse
 import json
 from pathlib import Path
 
 import faiss
-
-from ...embedder import JinaCodeEmbedder
 
 
 def load_docs(docs_path: Path):
@@ -25,6 +22,9 @@ def cmd_query(args):
     docs = load_docs(comp / "docs.jsonl")
     index = faiss.read_index(str(comp / "faiss" / "index.faiss"))
 
+    # Lazy import: evita di caricare transformers quando non serve
+    from ...embedder import JinaCodeEmbedder
+
     embedder = JinaCodeEmbedder(model_name=model_name, max_seq_length=max_seq_length)
     q = embedder.embed_texts([args.query]).astype("float32")
 
@@ -41,6 +41,3 @@ def cmd_query(args):
         if meta.get("path"):
             print(f"   path={meta['path']} lines={meta.get('line_start')}-{meta.get('line_end')}")
         print(d["text"])
-
-
-

@@ -1,0 +1,10 @@
+cpm_schema: 1
+name: media-storage-be
+version: 0.0.0
+description: "Auto-built from C:/Users/redeg/Documents/Progetti/media-storage-be"
+tags: cpm,docs,java
+entrypoints: query
+embedding_model: jinaai/jina-embeddings-v2-base-code
+embedding_dim: 768
+embedding_normalized: true
+created_at: "2026-01-29T00:48:58.555857Z"
