@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import requests
@@ -11,7 +11,7 @@ import requests
 @dataclass
 class HttpEmbedder:
     base_url: str  # e.g. http://127.0.0.1:8765
-    timeout_s: float = 180.0  # più realistico su cold start
+    timeout_s: Optional[float] = None  # None = nessun timeout
 
     def health(self) -> bool:
         try:

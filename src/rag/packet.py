@@ -170,6 +170,7 @@ def build_packet(
     archive: bool = True,
     archive_format: str = "tar.gz",
     version: str = "0.0.0",
+    timeout: float = None,
 ) -> None:
     in_root = Path(input_dir)
     out_root = Path(packet_dir)
@@ -235,7 +236,7 @@ def build_packet(
 
     # 3) embed (via HTTP embedding server)
     embed_url = os.environ.get("RAG_EMBED_URL", "http://127.0.0.1:8765")
-    client = HttpEmbedder(embed_url)
+    client = HttpEmbedder(embed_url, timeout_s=timeout)
     if not client.health():
         print(f"[error] embedding server not reachable at {embed_url}")
         print("        - start it with: python -m uvicorn rag.embedding_server:app --host 127.0.0.1 --port 8765")

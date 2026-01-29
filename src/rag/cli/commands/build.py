@@ -13,6 +13,7 @@ def cmd_build(args):
         overlap_lines=args.overlap_lines,
         archive=args.archive,
         archive_format=args.archive_format,
+        timeout=args.timeout,
     )
 
 
@@ -27,6 +28,7 @@ def cmd_cpm_build(args):
         archive=args.archive,
         archive_format=args.archive_format,
         version=args.version,
+        timeout=args.timeout,
     )
 
 
@@ -39,5 +41,5 @@ def add_common_build_args(parser: argparse.ArgumentParser) -> None:
                         help="Create a compressed archive alongside the packet directory (default: enabled)")
     parser.add_argument("--archive_format", choices=["tar.gz", "zip"], default="tar.gz",
                         help="Archive format (default: tar.gz)")
-
-
+    parser.add_argument("--timeout", type=float, default=None,
+                        help="HTTP request timeout in seconds (default: no timeout)")

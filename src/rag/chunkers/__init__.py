@@ -3,7 +3,7 @@ from .router import ChunkerRouter
 from .token_budget import TokenBudgeter
 
 from .treesitter_generic import TreeSitterGenericChunker
-from .java_ast import JavaAstChunker
+from .java import JavaChunker
 from .python_ast import PythonAstChunker
 from .markdown import MarkdownChunker
 from .text import TextChunker
@@ -15,7 +15,7 @@ __all__ = [
     "ChunkerRouter",
     "TokenBudgeter",
     "TreeSitterGenericChunker",
-    "JavaAstChunker",
+    "JavaChunker",
     "PythonAstChunker",
     "MarkdownChunker",
     "TextChunker",

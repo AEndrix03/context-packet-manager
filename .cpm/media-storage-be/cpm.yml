@@ -7,4 +7,4 @@ entrypoints: query
 embedding_model: jinaai/jina-embeddings-v2-base-code
 embedding_dim: 768
 embedding_normalized: true
-created_at: "2026-01-29T00:48:58.555857Z"
+created_at: "2026-01-29T23:11:07.891032Z"

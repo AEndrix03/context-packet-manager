@@ -27,8 +27,8 @@
     "calibration": null
   },
   "counts": {
-    "docs": 35,
-    "vectors": 35
+    "docs": 34,
+    "vectors": 34
   },
   "source": {
     "input_dir": "C:/Users/redeg/Documents/Progetti/media-storage-be",
@@ -52,19 +52,19 @@
   "checksums": {
     "cpm.yml": {
       "algo": "sha256",
-      "value": "cb26470ce11779385ad2eb477265b723533fc9f1c1e3d67cdb79baec0747dbcc"
+      "value": "1b6944a8b46594285dc99432ae8e904f2bf915e33913cbd52d3e4ae96c72a926"
     },
     "docs.jsonl": {
       "algo": "sha256",
-      "value": "f82515359c25ac3d41572215a225cc98f9a9011cef75bd9cfdae6d216b147e4e"
+      "value": "80100756f85c73895e118a8ec3cf5bb3524e1b9e0252715c589922c9699cc451"
     },
     "vectors.f16.bin": {
       "algo": "sha256",
-      "value": "e368e93723ee8365863c07fbdbcb10f1d081feb98d9038ce614db68d3c8425f5"
+      "value": "72d2152445a6c31853165cc486a795d755b374d284399b633f51f717e200ff3e"
     },
     "faiss/index.faiss": {
       "algo": "sha256",
-      "value": "359ac519dac376a4e1640b47b3c9dcd915a822e733515aba6ca2025eb807c7f5"
+      "value": "ba540300f5fb6b7e0b3259a0a79f3271d9a4f5b3ea2ced5e3cf628846fc6b4cd"
     }
   }
 }
