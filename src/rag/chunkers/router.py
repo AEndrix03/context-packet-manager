@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
 
-from src.rag.schema import Chunk  # adjust if needed
+from ..schema import Chunk  # adjust if needed
 from .base import ChunkingConfig, BaseChunker
 from .token_budget import TokenBudgeter
 from .treesitter_generic import TreeSitterGenericChunker

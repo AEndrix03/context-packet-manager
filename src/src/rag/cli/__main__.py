@@ -1,4 +1,4 @@
-from .cli.parser import build_parser
+from .parser import build_parser
 
 def main():
     ap = build_parser()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Sequence, Dict, Any, Iterable
 
-from src.rag.schema import Chunk
+from ..schema import Chunk
 
 
 TokenCounter = Callable[[str], int]

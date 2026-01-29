@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
 
-from src.rag.schema import Chunk
+from ..schema import Chunk
 
 
 @dataclass(frozen=True)

@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 import ast
 
-from src.rag.schema import Chunk
+from ..schema import Chunk
 from .base import ChunkingConfig
 from .token_budget import TokenBudgeter, Block
 

@@ -1,5 +1,8 @@
 import os
 import json
+import hashlib
+import tarfile
+import zipfile
 from pathlib import Path
 from typing import List, Dict, Any, Iterable
 
@@ -30,22 +33,75 @@ def write_docs_jsonl(chunks: List[Chunk], out_path: Path) -> None:
         for c in chunks:
             f.write(json.dumps({"id": c.id, "text": c.text, "metadata": c.metadata}, ensure_ascii=False) + "\n")
 
-def build_component(
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _write_checksums(manifest: Dict[str, Any], out_root: Path) -> None:
+    # checksum only large immutable artifacts (exclude manifest itself to avoid recursion)
+    targets = [
+        out_root / "cpm.yml",
+        out_root / "docs.jsonl",
+        out_root / "vectors.f16.bin",
+        out_root / "faiss" / "index.faiss",
+    ]
+    checksums: Dict[str, Dict[str, str]] = {}
+    for p in targets:
+        if p.exists():
+            rel = str(p.relative_to(out_root)).replace("\\", "/")
+            checksums[rel] = {"algo": "sha256", "value": _sha256_file(p)}
+    manifest["checksums"] = checksums
+
+def _archive_packet_dir(out_root: Path, archive_format: str = "tar.gz") -> Path:
+    # produce out_root.<ext> next to the folder (npm-like tarball)
+    if archive_format not in ("tar.gz", "zip"):
+        raise ValueError(f"Unsupported archive_format: {archive_format}")
+
+    archive_path = Path(str(out_root) + (".tar.gz" if archive_format == "tar.gz" else ".zip"))
+    if archive_path.exists():
+        archive_path.unlink()
+
+    if archive_format == "tar.gz":
+        with tarfile.open(archive_path, "w:gz") as tf:
+            tf.add(out_root, arcname=out_root.name)
+    else:
+        with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for p in out_root.rglob("*"):
+                if p.is_file():
+                    arcname = str(Path(out_root.name) / p.relative_to(out_root)).replace("\\", "/")
+                    zf.write(p, arcname)
+    return archive_path
+
+
+def build_packet(
     input_dir: str,
-    component_dir: str,
+    packet_dir: str,
     model_name: str = "jinaai/jina-embeddings-v2-base-code",
     max_seq_length: int = 1024,
     lines_per_chunk: int = 80,
     overlap_lines: int = 10,
+    archive: bool = True,
+    archive_format: str = "tar.gz",
+    version: str = "0.0.0",
 ) -> None:
     in_root = Path(input_dir)
-    out_root = Path(component_dir)
+    out_root = Path(packet_dir)
 
     print(f"[build] input_dir  = {in_root.resolve()}")
     print(f"[build] output_dir = {out_root.resolve()}")
 
     out_root.mkdir(parents=True, exist_ok=True)
     (out_root / "faiss").mkdir(parents=True, exist_ok=True)
+
+    # Create cpm.yml
+    cpm_yml_path = out_root / "cpm.yml"
+    with cpm_yml_path.open("w", encoding="utf-8") as f:
+        f.write(f"cpm_version: {version}\n")
+        f.write(f"version: {version}\n")
+    print(f"[write] cpm.yml -> {cpm_yml_path}")
 
     # 1) scan + chunk
     chunks: List[Chunk] = []
@@ -115,7 +171,7 @@ def build_component(
     db.save(str(index_path))
     print(f"[write] faiss/index.faiss -> {index_path}")
 
-    # 5) save vectors f16 (optional but matches your component format)
+    # 5) save vectors f16 (optional but matches your packet format)
     vectors_path = out_root / "vectors.f16.bin"
     vecs.astype("float16").tofile(str(vectors_path))
     print(f"[write] vectors.f16.bin -> {vectors_path}")
@@ -123,7 +179,7 @@ def build_component(
     # 6) manifest
     manifest: Dict[str, Any] = {
         "schema_version": "1.0",
-        "component_id": out_root.name,
+        "packet_id": out_root.name,
         "embedding": {
             "provider": "sentence-transformers",
             "model": model_name,
@@ -145,8 +201,15 @@ def build_component(
         },
         "counts": {"docs": len(chunks), "vectors": int(db.index.ntotal)},
     }
+    _write_checksums(manifest, out_root)
     manifest_path = out_root / "manifest.json"
     with manifest_path.open("w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     print(f"[write] manifest.json -> {manifest_path}")
+
+    # 7) archive
+    if archive:
+        archive_path = _archive_packet_dir(out_root, archive_format)
+        print(f"[write] archive -> {archive_path}")
+
     print("[done] build ok")
