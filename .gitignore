@@ -7,3 +7,5 @@ components/
 **/__pycache__/**
 
 **/.env
+**/*.log
+**/*.pid

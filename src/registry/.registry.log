@@ -59,3 +59,8 @@ INFO:     Shutting down
 INFO:     Waiting for application shutdown.
 INFO:     Application shutdown complete.
 INFO:     Finished server process [20040]
+Starting registry on http://127.0.0.1:8786  (env: registry\.env)
+INFO:     Started server process [7636]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8786 (Press CTRL+C to quit)
