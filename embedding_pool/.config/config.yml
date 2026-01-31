@@ -1,0 +1,23 @@
+version: 1
+client:
+  base_url: "http://127.0.0.1:8876"
+server:
+  host: "127.0.0.1"
+  port: 8876
+paths:
+  root: ".config"
+  pool_yml: ".config/pool.yml"
+  config_yml: ".config/config.yml"
+  state_dir: ".config/state"
+  logs_dir: ".config/logs"
+  cache_dir: ".config/cache"
+process:
+  pid_file: ".config/state/pool.pid"
+logging:
+  level: "info"
+defaults:
+  request_timeout_s: 120
+  max_queue_per_model: 1000
+  max_inflight_global: 256
+hot_reload:
+  enabled: true

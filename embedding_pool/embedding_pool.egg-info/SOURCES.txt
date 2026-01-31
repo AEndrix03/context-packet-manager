@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+embedding_pool.egg-info/PKG-INFO
+embedding_pool.egg-info/SOURCES.txt
+embedding_pool.egg-info/dependency_links.txt
+embedding_pool.egg-info/entry_points.txt
+embedding_pool.egg-info/requires.txt
+embedding_pool.egg-info/top_level.txt
+embedpool/__init__.py
+embedpool/cli.py
+embedpool/core/drivers.py
+embedpool/core/runtime.py
+embedpool/core/store.py
+embedpool/core/types.py
+embedpool/core/util.py
+embedpool/server/__main__.py
+embedpool/server/app.py
