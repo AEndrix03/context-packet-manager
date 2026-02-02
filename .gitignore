@@ -9,3 +9,8 @@ components/
 **/.env
 **/*.log
 **/*.pid
+
+**/*.d
+**/.cpm/
+**/*.egg-info/
+**/.venv/

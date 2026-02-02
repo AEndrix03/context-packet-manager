@@ -1,21 +1,75 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "embedding-pool"
-version = "0.0.0"
-description = "Standalone Embedding Pool with hot-reload, scaling and HTTP API"
-requires-python = ">=3.10"
+version = "0.1.0"
+description = "Ollama-like embedding pool with autoscaling runtimes (CPM companion)."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Andrea Redegalli" }]
+keywords = ["embeddings", "rag", "sentence-transformers", "faiss", "autoscaling", "cpm"]
 dependencies = [
-    "fastapi>=0.110",
-    "uvicorn>=0.24",
-    "pydantic>=2.0",
-    "PyYAML>=6.0",
-    "requests>=2.31",
-    "numpy>=1.24",
-    "sentence-transformers>=2.2.2",
+    # --- API / server ---
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.27,<1",
+    "pydantic>=2.6,<3",
+    "pyyaml>=6,<7",
+    # --- HTTP client (driver http) ---
+    "requests>=2.31,<3",
+    # --- Core numeric ---
+    "numpy>=1.26,<3",
+    # --- HuggingFace stack (cruciale per jina v2 & trust_remote_code) ---
+    "transformers>=4.41,<5",
+    "tokenizers>=0.15,<1",
+    "huggingface-hub>=0.20,<1",
+    "safetensors>=0.4,<1",
+    "accelerate>=0.26,<2",
+    # --- Sentence Transformers (molti modelli embeddings passano da qui) ---
+    "sentence-transformers>=2.3,<4",
+    # --- Logging ---
+    "rich>=13,<15",
+]
+
+# Torch: NON metterlo qui per massima portabilità.
+# Motivo: su Windows/macOS/Linux e CPU/GPU cambia come si installa.
+# Lo metti negli extra (vedi sotto).
+
+[project.optional-dependencies]
+# CPU: installazione semplice e portabile (user fa pip install .[cpu])
+cpu = [
+    "torch>=2.1",
+]
+
+# GPU: volutamente lasciato "vuoto" perché su NVIDIA dipende da CUDA (cu118/cu121/cu122).
+# Qui puoi documentare nel README come installarlo.
+gpu = [
+    "torch>=2.1",
+]
+
+# Dev tools
+dev = [
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.23,<1",
+    "ruff>=0.4,<1",
+    "mypy>=1.8,<2",
+    "types-PyYAML",
+    "httpx>=0.26,<1",
 ]
 
 [project.scripts]
-embedpool = "embedpool.cli:main"
+embedpool = "cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

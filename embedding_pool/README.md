@@ -7,6 +7,15 @@ python -m venv .venv
 pip install -U pip
 pip install -e .
 
+### Use with CPU
+
+pip install -e ".[cpu]"
+
+### Use with GPU
+
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+pip install -e ".[gpu]"
+
 ## Init (creates .config/ in current dir)
 
 embedpool init
