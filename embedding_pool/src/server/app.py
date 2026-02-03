@@ -4,6 +4,7 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
+import numpy as np
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -11,6 +12,7 @@ from core.runtime import ModelRuntime
 from core.store import load_config, load_pool, save_pool
 from core.types import PoolFile, ModelSpec, DriverSpec, ScalingSpec, QueueSpec
 from core.util import ensure_dirs
+from core.embed_cache import EmbedCache
 
 log = logging.getLogger("src")
 
@@ -63,6 +65,7 @@ def create_app(config_path: str) -> FastAPI:
         "global_sem": asyncio.Semaphore(int(cfg.max_inflight_global)),
         "booted": False,
         "last_reload": None,
+        "cache": EmbedCache(cfg.cache_dir),
     }
 
     def _alias_conflicts(pf: PoolFile) -> None:
@@ -100,6 +103,18 @@ def create_app(config_path: str) -> FastAPI:
     async def reload_pool(reason: str) -> None:
         pf = load_pool(state["pool_path"])
         await _apply_pool(pf)
+
+        # prune cache when pool changes: remove entries for deleted models
+        try:
+            cache: EmbedCache = state["cache"]
+            allowed = [m.model for m in (pf.models or [])]
+            removed_rows = cache.prune_models(allowed)
+            if removed_rows:
+                log.info("cache pruned: removed_rows=%s", removed_rows)
+        except Exception:
+            # non blocchiamo il reload per problemi cache
+            pass
+
         state["last_reload"] = {"reason": reason}
 
     def resolve_model(name_or_alias: str) -> str:
@@ -144,6 +159,7 @@ def create_app(config_path: str) -> FastAPI:
     async def embed(req: EmbedReq):
         if not req.texts:
             raise HTTPException(status_code=400, detail="texts must be non-empty")
+
         try:
             model_name = resolve_model(req.model)
         except KeyError:
@@ -153,11 +169,54 @@ def create_app(config_path: str) -> FastAPI:
         if rt is None:
             raise HTTPException(status_code=500, detail=f"runtime missing for model: {model_name}")
 
+        cache: EmbedCache = state["cache"]
+
+        # 1) cache lookup
         try:
-            arr, dim, meta = await rt.enqueue(req.texts, dict(req.options or {}))
-            return {"model": model_name, "dim": dim, "vectors": arr.tolist(), "meta": meta}
+            hashes, found = cache.get_many(model_name, list(req.texts))
+        except Exception:
+            hashes, found = ([], {})
+
+        # 2) build missing batch
+        missing_idx = [i for i in range(len(req.texts)) if i not in found]
+        if not missing_idx:
+            # all hit
+            vecs = np.stack([found[i] for i in range(len(req.texts))], axis=0).astype(np.float32, copy=False)
+            dim = int(vecs.shape[1])
+            return {"model": model_name, "dim": dim, "vectors": vecs.tolist(), "meta": {"cache": "hit"}}
+
+        missing_texts = [req.texts[i] for i in missing_idx]
+
+        # 3) embed missing
+        try:
+            arr_missing, dim, meta = await rt.enqueue(missing_texts, dict(req.options or {}))
+            if arr_missing.ndim == 1:
+                arr_missing = arr_missing.reshape(1, -1)
+            if arr_missing.dtype != np.float32:
+                arr_missing = arr_missing.astype(np.float32)
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+        # 4) merge (original order)
+        out = np.empty((len(req.texts), int(dim)), dtype=np.float32)
+        for i, v in found.items():
+            out[i] = v
+        for j, i in enumerate(missing_idx):
+            out[i] = arr_missing[j]
+
+        # 5) save missing into cache
+        try:
+            miss_hashes = [hashes[i] for i in missing_idx] if hashes else []
+            if miss_hashes and len(miss_hashes) == arr_missing.shape[0]:
+                cache.put_many(model_name, miss_hashes, arr_missing)
+        except Exception:
+            pass
+
+        # enrich meta
+        meta = dict(meta or {})
+        meta["cache"] = {"hits": len(found), "misses": len(missing_idx)}
+
+        return {"model": model_name, "dim": int(dim), "vectors": out.tolist(), "meta": meta}
 
     # management endpoints (for live edits)
     @app.post("/models/register")
@@ -204,12 +263,12 @@ def create_app(config_path: str) -> FastAPI:
         if pf is None:
             raise HTTPException(status_code=500, detail="pool not loaded")
 
-        found = False
+        found_any = False
         for m in pf.models:
             if m.model == req.model or (m.alias and m.alias == req.model):
                 m.enabled = bool(req.enabled)
-                found = True
-        if not found:
+                found_any = True
+        if not found_any:
             raise HTTPException(status_code=404, detail=f"unknown model/alias: {req.model}")
 
         save_pool(state["pool_path"], pf)
@@ -222,12 +281,12 @@ def create_app(config_path: str) -> FastAPI:
         if pf is None:
             raise HTTPException(status_code=500, detail="pool not loaded")
 
-        found = False
+        found_any = False
         for m in pf.models:
             if m.model == req.model or (m.alias and m.alias == req.model):
                 m.alias = (req.alias.strip() if req.alias else None)
-                found = True
-        if not found:
+                found_any = True
+        if not found_any:
             raise HTTPException(status_code=404, detail=f"unknown model/alias: {req.model}")
 
         save_pool(state["pool_path"], pf)
