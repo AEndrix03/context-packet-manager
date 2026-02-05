@@ -1,0 +1,7 @@
+[plugin]
+id = "mcp"
+name = "CPM MCP Plugin"
+version = "0.1.0"
+group = "mcp"
+entrypoint = "cpm_mcp_plugin.entrypoint:MCPEntrypoint"
+requires_cpm = ">=0.1.0"

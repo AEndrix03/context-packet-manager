@@ -1,0 +1,7 @@
+[plugin]
+id = "failing_plugin"
+name = "Failing Plugin"
+version = "0.1.0"
+group = "failing"
+entrypoint = "failing_plugin.entrypoint:FailingPlugin"
+requires_cpm = ">=0.1.0"

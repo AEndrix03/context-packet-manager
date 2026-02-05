@@ -45,6 +45,13 @@ def build_parser() -> argparse.ArgumentParser:
     cpm_query.add_argument("--packet", required=True, help="Packet name (folder), or direct path to packet folder")
     cpm_query.add_argument("--query", required=True)
     cpm_query.add_argument("-k", type=int, default=5)
+    cpm_query.add_argument(
+        "--metadata",
+        "-m",
+        action="append",
+        default=[],
+        help="Limit results to docs whose metadata matches KEY=VALUE (repeatable)",
+    )
     cpm_query.add_argument("--no-cache", action="store_true")
     cpm_query.add_argument("--cache-refresh", action="store_true")
     cpm_query.set_defaults(func=_cmd_query)

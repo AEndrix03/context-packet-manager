@@ -1,0 +1,7 @@
+[plugin]
+id = "sample_plugin"
+name = "Sample Plugin"
+version = "0.1.0"
+group = "sample"
+entrypoint = "sample_plugin.entrypoint:PluginEntrypoint"
+requires_cpm = ">=0.1.0"

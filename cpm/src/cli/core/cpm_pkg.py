@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
@@ -8,7 +9,11 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
-from cli.core.client import RegistryClient
+from cli.core.client import (
+    RegistryClient,
+    RegistryPackageList,
+    RegistryPackageVersion,
+)
 
 
 # ============================================================
@@ -290,11 +295,10 @@ def registry_latest_version(client: RegistryClient, name: str) -> str:
     Latest = max by semantic ordering (NOT by published_at).
     """
     data = client.list(name, include_yanked=False)
-    versions = data.get("versions") or []
-    if not versions:
+    if not data.versions:
         raise RuntimeError(f"no versions found on registry for {name}")
 
-    vs = [str(v.get("version")) for v in versions if v.get("version")]
+    vs = [v.version for v in data.versions if v.version]
     if not vs:
         raise RuntimeError(f"no valid versions found on registry for {name}")
 
@@ -467,6 +471,49 @@ def _safe_tar_extract(tf: tarfile.TarFile, dest: Path) -> None:
     tf.extractall(dest)
 
 
+def _sha256_file(path: Path) -> str:
+    hash_obj = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            hash_obj.update(chunk)
+    return hash_obj.hexdigest()
+
+
+def _verify_tarball(path: Path, metadata: RegistryPackageVersion) -> None:
+    if metadata.sha256:
+        actual = _sha256_file(path)
+        if actual != metadata.sha256:
+            raise RuntimeError(
+                f"tarball checksum mismatch for {metadata.name}@{metadata.version}: "
+                f"expected {metadata.sha256} but got {actual}"
+            )
+    if metadata.size_bytes is not None:
+        actual_size = path.stat().st_size
+        if actual_size != metadata.size_bytes:
+            raise RuntimeError(
+                f"tarball size mismatch for {metadata.name}@{metadata.version}: "
+                f"expected {metadata.size_bytes} bytes but got {actual_size}"
+            )
+
+
+def _extract_version_from_tar(
+    tar_path: Path, staging: Path, cpm_dir: Path, name: str, version: str
+) -> Path:
+    with tarfile.open(tar_path, "r:gz") as tf:
+        _safe_tar_extract(tf, staging)
+
+    extracted = staging.joinpath(name, *split_version_parts(version))
+    if not extracted.exists():
+        raise RuntimeError(f"extracted payload missing for {name}@{version}")
+
+    final_dir = version_dir(cpm_dir, name, version)
+    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    if final_dir.exists():
+        shutil.rmtree(final_dir)
+    shutil.move(str(extracted), str(final_dir))
+    return final_dir
+
+
 def make_versioned_tar_from_build_dir(src_dir: Path, name: str, version: str, out_path: Path) -> None:
     """
     Create tar.gz with layout:
@@ -501,11 +548,11 @@ def download_and_extract(client: RegistryClient, name: str, version: str, cpm_di
     Download tar and extract into cpm_dir. Returns extracted version directory path.
     """
     cpm_dir.mkdir(parents=True, exist_ok=True)
+    metadata = client.get_version(name, version)
+
     with tempfile.TemporaryDirectory(prefix="cpm-install-") as tmpd:
         tmp = Path(tmpd)
         tar_path = tmp / f"{name}-{version}.tar.gz"
         client.download(name, version, str(tar_path))
-        with tarfile.open(tar_path, "r:gz") as tf:
-            _safe_tar_extract(tf, cpm_dir)
-
-    return version_dir(cpm_dir, name, version)
+        _verify_tarball(tar_path, metadata)
+        return _extract_version_from_tar(tar_path, tmp, cpm_dir, name, version)

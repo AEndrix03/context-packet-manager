@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpm"
+version = "0.1.0"
+description = "Baseline CPM vNext implementation with lightweight core, CLI, and plugin surface."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "platformdirs>=3.8",
+    "numpy>=1.25",
+    "faiss-cpu>=1.7,<2",
+    "requests>=2.30",
+    "PyYAML>=6.0",
+    "mcp>=1.26,<2",
+]
+keywords = ["cpm", "rag", "plugin", "cli"]
+authors = [
+    {name = "Component RAG Team"},
+]
+
+[project.optional-dependencies]
+dev = ["black>=24.0", "ruff>=0.0", "mypy>=1.9", "pytest>=7.3"]
+
+[project.entry-points.console_scripts]
+cpm = "cpm_cli.__main__:main"
+
+[tool.setuptools.packages.find]
+include = [
+    "cpm_core*",
+    "cpm_cli*",
+    "cpm_builtin*",
+    "cpm_plugins*",
+]
+
+[tool.black]
+line-length = 120
+target-version = ["py311"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+select = ["E", "F", "I", "N", "PL", "Q", "R"]
+
+[tool.mypy]
+python_version = "3.11"
+check_untyped_defs = true
+disallow_incomplete_defs = true
+follow_imports = "silent"
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"

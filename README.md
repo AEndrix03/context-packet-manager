@@ -82,61 +82,70 @@ pip install -e ./cpm-registry
 
 ## Quick Start
 
-### 1. Initialize CPM Configuration
+### 1. Bootstrap the workspace and sanity-check the environment
 
 ```bash
 cpm init
+cpm doctor
 ```
 
-This creates a `.cpm` directory with `config.yml` and `pool.yml` configuration files.
+`cpm doctor` verifies the workspace layout, validates `.cpm/config/embeddings.yml`, reports plugin status, shows the configured registry endpoint, and prints quick alias hints for the legacy commands that still live under `cpm/src/cli`.
 
-### 2. Start the Embedding Server
+### 2. Register an embedding provider (legacy alias)
 
 ```bash
-# Register an embedding model
-cpm embed register --model jinaai/jina-embeddings-v2-base-en \
-  --type local_st --max-seq-length 512 --normalize --alias jina-en
+cpm embed add \
+  --name local-encoder \
+  --type http \
+  --url http://127.0.0.1:8876 \
+  --model jinaai/jina-embeddings-v2-base-en \
+  --dims 768
+```
 
-# Start server in background
+Embedding commands such as `cpm embed add/start-server/status` currently delegate to the helper under `cpm_cli/cli.py`, keeping the provider management flow stable while the new `cpm_core` command surface evolves. The example above updates the `.cpm/config/embeddings.yml` that `cpm doctor` monitors.
+
+### 3. Start an embedding server
+
+Use your preferred embedding server (for instance the local `embedding_pool` service):
+
+```bash
 cpm embed start-server --detach
 ```
 
-### 3. Build Your First Context Packet
+### 4. Build a context packet
 
 ```bash
-# Build from a source directory
-cpm build --input-dir ./my-docs \
-  --packet-dir ./packets/my-knowledge-base \
-  --model jina-en \
-  --version 1.0.0 \
-  --archive
+cpm build --source ./docs --destination ./packets/my-knowledge-base \
+  --model jinaai/jina-embeddings-v2-base-en --embed-url http://127.0.0.1:8876 --packet-version 1.0.0
 ```
 
-### 4. Query the Packet
+You can point `--embed-url` to any service that exposes the `/embed` and `/health` endpoints; `embedding_pool` is a recommended local option.
+
+### 5. Query the packet (legacy alias)
 
 ```bash
-# Search for relevant context
-cpm query --packet my-knowledge-base \
-  --query "How do I configure authentication?" \
-  -k 5
+cpm query --packet my-knowledge-base --query "authentication setup" -k 5
 ```
 
-### 5. Publish to Registry (Optional)
+This command routes through the legacy CLI so the old query interface stays available while the new MCP-powered flow evolves.
+
+### 6. Publish and install via the registry
 
 ```bash
-# Start registry server
 cpm-registry start --detach
-
-# Publish packet
-cpm publish --from ./packets/my-knowledge-base \
-  --registry http://localhost:8786
-
-# Install on another machine
-cpm install my-knowledge-base@1.0.0 \
-  --registry http://localhost:8786
+cpm publish --from ./packets/my-knowledge-base --registry http://localhost:8786
+cpm install my-knowledge-base@1.0.0 --registry http://localhost:8786
 ```
+
+`cpm publish/install` still use the legacy registry client, so the new CLI simply reuses the old, proven behavior but now lives inside the `cpm_core` feature registry.
 
 ---
+
+## Legacy Compatibility
+
+The root `cpm` executable is backed by `cpm_core`, while the familiar legacy commands still work. Embedding commands (`cpm embed ...`) are routed through the helper defined in `cpm_cli/cli.py`, and the other legacy tokens (`query`, `publish`, `install`, `prune`, etc.) are forwarded to the parser under `cpm/src/cli`, so your scripts continue to behave as before.
+
+`cpm doctor` surfaces that alias table alongside workspace tips: it warns if it finds artifacts in the legacy `.cpm/<packet>` layout and shows how the modern `.cpm/packages`, `.cpm/config`, and `.cpm/state` hierarchy is structured.
 
 ## Configuration
 

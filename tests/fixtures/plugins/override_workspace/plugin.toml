@@ -1,0 +1,7 @@
+[plugin]
+id = "override_plugin"
+name = "Override Plugin"
+version = "0.1.0"
+group = "override"
+entrypoint = "override_plugin.entrypoint:OverrideEntrypoint"
+requires_cpm = ">=0.1.0"

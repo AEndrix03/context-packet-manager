@@ -46,4 +46,4 @@ def cmd_cpm_publish(args) -> None:
         make_versioned_tar_from_build_dir(src_dir, name, version, tar_path)
         res = client.publish(name, version, str(tar_path), overwrite=bool(args.overwrite))
 
-    print(f"[cpm:publish] ok {name}@{version} sha256={res.get('sha256')} size={res.get('size_bytes')}")
+    print(f"[cpm:publish] ok {name}@{version} sha256={res.sha256} size={res.size_bytes}")
