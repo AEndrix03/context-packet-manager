@@ -74,9 +74,12 @@ def start(
             LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
             log = open(LOG_FILE, "ab", buffering=0)
 
-            # NOTE: if your module path is different (e.g. rag.registry.cli),
-            # change this string accordingly.
-            cmd = [str(Path(sys.executable).parent / "cpm.exe"), "start", "--host", host, "--port", str(port)]
+            launcher = sys.argv[0] if sys.argv else "cpm-registry"
+            launcher_path = Path(launcher)
+            if launcher_path.suffix == ".py":
+                cmd = [sys.executable, str(launcher_path), "start", "--host", host, "--port", str(port)]
+            else:
+                cmd = [launcher, "start", "--host", host, "--port", str(port)]
             if env_file:
                 cmd.extend(["--env-file", env_file])
 

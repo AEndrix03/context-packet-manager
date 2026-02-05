@@ -246,24 +246,31 @@ def _run_embed_cli(tokens: Sequence[str]) -> int:
 
 
 def _run_legacy_cli(tokens: Sequence[str]) -> int:
-    try:
-        from cpm.src.cli.parser import build_parser as _build_legacy_parser
-    except Exception as exc:
-        print(f"[cpm] legacy CLI unavailable: {exc}")
-        return 1
+    command = tokens[0] if tokens else ""
+    tail = list(tokens[1:])
 
-    parser = _build_legacy_parser()
-    try:
-        args = parser.parse_args(tokens)
-    except SystemExit as exc:
-        return exc.code or 0
+    if command == "mcp":
+        # Historical alias: `cpm mcp serve ...` -> `cpm serve ...`
+        if tail and tail[0] == "serve":
+            tail = tail[1:]
+        return main(["serve", *tail])
 
-    func = getattr(args, "func", None)
-    if func is None:
-        parser.print_help()
-        return 0
-    func(args)
-    return 0
+    alias_map: dict[str, list[str]] = {
+        "lookup": ["pkg", "list"],
+        "use": ["pkg", "use"],
+        "prune": ["pkg", "prune"],
+    }
+
+    mapped_prefix = alias_map.get(command)
+    if mapped_prefix is not None:
+        return main([*mapped_prefix, *tail])
+
+    print(
+        "[cpm] legacy command bridge has been removed from this repository; "
+        f"'{command}' is no longer delegated to cpm/src/cli."
+    )
+    print("[cpm] use 'cpm help --long' to list supported commands.")
+    return 1
 
 
 def to_int(result: int | None) -> int:

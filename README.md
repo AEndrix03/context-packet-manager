@@ -220,6 +220,251 @@ REGISTRY_S3_SECRET_KEY=your_secret_key
 
 ---
 
+## Plugin System
+
+CPM vNext features a powerful, extensible plugin system that allows you to add custom commands, builders, and retrievers without modifying the core codebase.
+
+### How the Plugin System Works
+
+The plugin system follows a lifecycle-based approach with automatic discovery, loading, and registration:
+
+1. **Discovery**: Plugins are discovered from workspace (`.cpm/plugins/`) and user directories (`~/.cpm/plugins/`)
+2. **Validation**: Each plugin must have a `plugin.toml` manifest that declares its features and entrypoint
+3. **Loading**: The entrypoint module is loaded and its features are registered in the global `FeatureRegistry`
+4. **Activation**: Plugin commands become available through the `cpm` CLI alongside built-in commands
+
+### Plugin Structure
+
+A minimal plugin consists of:
+
+```
+my-plugin/
+├── plugin.toml          # Plugin manifest
+├── __init__.py          # Python package
+└── entrypoint.py        # Plugin entrypoint
+```
+
+**plugin.toml example:**
+
+```toml
+[plugin]
+id = "my-plugin"
+name = "My Custom Plugin"
+version = "1.0.0"
+description = "Adds custom commands to CPM"
+entrypoint = "entrypoint:register_plugin"
+
+[plugin.metadata]
+author = "Your Name"
+license = "MIT"
+```
+
+**entrypoint.py example:**
+
+```python
+from cpm_core.api import CPMAbstractCommand, cpmcommand
+from cpm_core.plugin import PluginContext
+
+@cpmcommand(name="greet", group="my-plugin")
+class GreetCommand(CPMAbstractCommand):
+    """Greet the user with a friendly message."""
+
+    def configure(self, parser):
+        parser.add_argument("--name", default="World", help="Name to greet")
+
+    def run(self, args):
+        print(f"Hello, {args.name}!")
+        return 0
+
+def register_plugin(ctx: PluginContext):
+    """Called during plugin loading."""
+    # Features auto-register via @cpmcommand decorator
+    pass
+```
+
+### Plugin Discovery
+
+Plugins are discovered in two locations with precedence:
+
+1. **Workspace plugins** (`.cpm/plugins/`) - Project-specific plugins
+2. **User plugins** (`~/.cpm/plugins/` or `%APPDATA%/cpm/plugins` on Windows) - User-wide plugins
+
+Workspace plugins take precedence when IDs collide. Place your `plugin.toml` and entrypoint in a subdirectory matching the plugin `id`.
+
+### Creating a Plugin Step-by-Step
+
+**Step 1**: Create plugin directory
+
+```bash
+mkdir -p .cpm/plugins/my-plugin
+cd .cpm/plugins/my-plugin
+```
+
+**Step 2**: Create `plugin.toml` manifest
+
+```toml
+[plugin]
+id = "my-plugin"
+name = "My Plugin"
+version = "1.0.0"
+entrypoint = "entrypoint:register_plugin"
+```
+
+**Step 3**: Create `entrypoint.py`
+
+```python
+from cpm_core.plugin import PluginContext
+from cpm_core.api import CPMAbstractCommand, cpmcommand
+
+@cpmcommand(name="custom", group="my-plugin")
+class CustomCommand(CPMAbstractCommand):
+    """A custom command."""
+
+    def configure(self, parser):
+        parser.add_argument("input", help="Input value")
+
+    def run(self, args):
+        print(f"Received: {args.input}")
+        return 0
+
+def register_plugin(ctx: PluginContext):
+    # Auto-registered via decorator
+    pass
+```
+
+**Step 4**: Test your plugin
+
+```bash
+cpm plugin:list          # Verify plugin is discovered
+cpm my-plugin:custom test  # Invoke your command
+```
+
+### Plugin Examples
+
+See `cpm_plugins/mcp/` for a complete, production-ready plugin that implements the Model Context Protocol server.
+
+---
+
+## Available Commands
+
+### Core Commands
+
+| Command | Description |
+|---------|-------------|
+| `cpm init` | Initialize CPM workspace (creates `.cpm/` structure) |
+| `cpm help` | Show available commands and usage |
+| `cpm help --long` | Show detailed command descriptions |
+| `cpm listing` | List all registered commands |
+| `cpm listing --format json` | Output commands as JSON |
+| `cpm doctor` | Validate workspace layout and configuration |
+
+### Plugin Commands
+
+| Command | Description |
+|---------|-------------|
+| `plugin:list` | List loaded plugins |
+| `plugin:doctor` | Diagnose plugin issues and show legacy compatibility |
+
+### Build & Query Commands
+
+| Command | Description |
+|---------|-------------|
+| `cpm build` | Build a context packet from source directory |
+| `cpm query` | Query installed packet for context (legacy) |
+
+### Package Management Commands
+
+| Command | Description |
+|---------|-------------|
+| `pkg:list` | List installed context packets |
+| `pkg:use` | Pin a specific packet version |
+| `pkg:prune` | Remove old packet versions |
+
+### Embedding Commands (Legacy)
+
+| Command | Description |
+|---------|-------------|
+| `cpm embed add` | Register an embedding provider |
+| `cpm embed start-server` | Start embedding server |
+| `cpm embed stop-server` | Stop embedding server |
+| `cpm embed status` | Check embedding server health |
+
+**Note**: Legacy commands (`query`, `publish`, `install`, etc.) are maintained for backward compatibility. Use `cpm doctor` to see the full alias table.
+
+---
+
+## Feature Highlights
+
+### Feature Registry Pattern
+
+All commands, builders, and retrievers register in a global `FeatureRegistry` using qualified names (`group:name`). This enables:
+
+- **Name collision handling**: Multiple plugins can provide a command with the same simple name
+- **Automatic disambiguation**: Use `group:name` syntax when names collide
+- **Discoverability**: `cpm listing` shows all available features
+
+Example:
+
+```bash
+# If two plugins both provide "build" command
+cpm cpm:build        # Use core build
+cpm my-plugin:build  # Use plugin build
+```
+
+### Event-Driven Plugin System
+
+Plugins can hook into the CPM lifecycle using the `EventBus`:
+
+```python
+def register_plugin(ctx: PluginContext):
+    def on_bootstrap(event):
+        print("CPM is bootstrapping!")
+
+    ctx.events.subscribe("bootstrap", on_bootstrap, priority=10)
+```
+
+Available events:
+- `bootstrap` - App initialization complete
+- `plugin.pre_discovery` - Before plugin discovery
+- `plugin.post_discovery` - After plugins are discovered
+- `plugin.pre_plugin_init` - Before loading a plugin
+- `plugin.post_plugin_init` - After plugin loading (success or failure)
+
+### Layered Configuration
+
+Configuration resolution follows a priority order:
+
+1. **CLI arguments** (highest priority)
+2. **Environment variables** (`RAG_CPM_DIR`, `RAG_EMBED_URL`, etc.)
+3. **Workspace config** (`.cpm/config/cpm.toml`)
+4. **User config** (`~/.cpm/config.toml`)
+5. **Defaults** (lowest priority)
+
+This allows per-project overrides while maintaining user-wide defaults.
+
+### Workspace Layout
+
+Modern CPM workspaces follow a structured layout:
+
+```
+.cpm/
+├── packages/           # Installed context packets
+│   └── <name>/
+│       └── <version>/  # Versioned packet directories
+├── config/             # Configuration files
+│   ├── cpm.toml        # Main config
+│   └── embeddings.yml  # Embedding providers
+├── plugins/            # Workspace plugins
+├── cache/              # Query caches
+├── state/              # Runtime state (pins, active versions)
+├── logs/               # Log files
+└── pins/               # Version pins
+```
+
+Use `cpm doctor` to validate your workspace layout and identify legacy artifacts.
+
+---
+
 ## Advanced Usage
 
 ### Language-Specific Chunking
