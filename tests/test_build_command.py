@@ -113,3 +113,34 @@ def test_build_command_can_select_plugin_builder(tmp_path: Path, monkeypatch) ->
         start_dir=tmp_path,
     )
     assert result == 0
+
+
+def test_build_describe_updates_packet_metadata(tmp_path: Path) -> None:
+    packet_dir = tmp_path / ".cpm" / "dist" / "docs" / "1.0.0"
+    packet_dir.mkdir(parents=True)
+    (packet_dir / "cpm.yml").write_text("name: docs\nversion: 1.0.0\ndescription: old\n", encoding="utf-8")
+    (packet_dir / "manifest.json").write_text(
+        '{"cpm": {"name": "docs", "version": "1.0.0", "description": "old"}}',
+        encoding="utf-8",
+    )
+
+    result = cli_main(
+        [
+            "build",
+            "--workspace-dir",
+            str(tmp_path),
+            "describe",
+            "--destination",
+            "dist",
+            "--name",
+            "docs",
+            "--packet-version",
+            "1.0.0",
+            "--description",
+            "new description",
+        ],
+        start_dir=tmp_path,
+    )
+    assert result == 0
+    assert "new description" in (packet_dir / "cpm.yml").read_text(encoding="utf-8")
+    assert "new description" in (packet_dir / "manifest.json").read_text(encoding="utf-8")

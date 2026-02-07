@@ -165,3 +165,41 @@ def test_query_command_supports_custom_retriever_selection(
     out = capsys.readouterr().out
     assert code == 0
     assert "[cpm:query] retriever=sample:custom-retriever packet=my-docs k=5" in out
+
+
+def test_query_command_passes_indexer_and_reranker(
+    monkeypatch, tmp_path: Path
+) -> None:
+    cli_main = importlib.import_module("cpm_cli.main")
+    query_builtin = importlib.import_module("cpm_core.builtins.query")
+    captured: dict[str, object] = {}
+
+    def _fake_retrieve(self, identifier: str, **kwargs):
+        captured.update(kwargs)
+        return {
+            "ok": True,
+            "packet": kwargs.get("packet"),
+            "query": identifier,
+            "k": kwargs.get("k", 5),
+            "results": [],
+        }
+
+    monkeypatch.setattr(query_builtin.NativeFaissRetriever, "retrieve", _fake_retrieve)
+    code = cli_main.main(
+        [
+            "query",
+            "--packet",
+            "my-docs",
+            "--query",
+            "auth",
+            "--indexer",
+            "faiss-flatip",
+            "--reranker",
+            "token-diversity",
+        ],
+        start_dir=tmp_path,
+    )
+
+    assert code == 0
+    assert captured.get("indexer") == "faiss-flatip"
+    assert captured.get("reranker") == "token-diversity"

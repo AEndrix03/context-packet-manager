@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-import numpy as np
 import yaml
 from cpm_builtin.embeddings import EmbeddingClient
 from cpm_core.api import CPMAbstractBuilder, cpmbuilder
@@ -17,17 +17,12 @@ from cpm_core.build.builder import (
     CODE_EXTS,
     DEFAULT_EMBED_URL,
     DEFAULT_MODEL,
+    PacketMaterializationInput,
     TEXT_EXTS,
-    _archive_packet_dir,
-    _chunk_hash,
-    _infer_tags,
-    _load_existing_cache,
+    materialize_packet,
     _read_text_file,
-    _write_cpm_yml,
 )
-from cpm_core.packet.faiss_db import FaissFlatIP
-from cpm_core.packet.io import compute_checksums, write_docs_jsonl, write_manifest, write_vectors_f16
-from cpm_core.packet.models import DocChunk, EmbeddingSpec, PacketManifest
+from cpm_core.packet.models import DocChunk, PacketManifest
 
 from .cache import CacheV2, FileCacheEntry, load_cache, save_cache
 from .classifiers import classify_file
@@ -111,7 +106,9 @@ class LLMBuilderRuntimeConfig:
     constraints: ChunkConstraints
     model_name: str
     max_seq_length: int
+    packet_name: str
     version: str
+    description: str | None
     archive: bool
     archive_format: str
     embed_url: str
@@ -129,7 +126,9 @@ class CPMLLMBuilder(CPMAbstractBuilder):
     def configure(cls, parser: argparse.ArgumentParser) -> None:
         parser.add_argument("source", help="Source directory to build")
         parser.add_argument("--destination", required=True, help="Destination packet directory")
+        parser.add_argument("--name", help="Packet name (defaults to destination directory name)")
         parser.add_argument("--packet-version", default="0.0.0", help="Packet version for manifest/cpm.yml")
+        parser.add_argument("--description", help="Packet description")
         parser.add_argument("--config", help="Plugin config.yml path (default: plugin config.yml)")
         parser.add_argument("--llm-endpoint", help="Override LLM endpoint from config")
         parser.add_argument("--request-timeout", type=float, help="Timeout in seconds for LLM calls")
@@ -188,7 +187,9 @@ class CPMLLMBuilder(CPMAbstractBuilder):
             constraints=constraints,
             model_name=str(getattr(args, "model_name", None) or DEFAULT_MODEL),
             max_seq_length=int(getattr(args, "max_seq_length", None) or 1024),
+            packet_name=str(getattr(args, "name", None) or Path(str(getattr(args, "destination"))).name),
             version=str(getattr(args, "packet_version", None) or "0.0.0"),
+            description=str(getattr(args, "description", None) or "").strip() or None,
             archive=bool(getattr(args, "archive", True)),
             archive_format=str(getattr(args, "archive_format", None) or "tar.gz"),
             embed_url=str(getattr(args, "embed_url", None) or DEFAULT_EMBED_URL),
@@ -404,173 +405,44 @@ class CPMLLMBuilder(CPMAbstractBuilder):
             "scan",
             f"llm_calls={llm_calls} file_cache_hits={file_cache_hits} segment_cache_hits={segment_cache_hits}",
         )
-        if not chunks:
-            print("[error] No chunks found.")
+        description = (self.config.description or source_path.as_posix()).strip() or source_path.as_posix()
+        packet_name = (self.config.packet_name or out_root.name).strip() or out_root.name
+        manifest = materialize_packet(
+            PacketMaterializationInput(
+                source_path=source_path,
+                out_root=out_root,
+                packet_name=packet_name,
+                packet_version=self.config.version,
+                description=description,
+                chunks=chunks,
+                ext_counts=ext_counts,
+                model_name=self.config.model_name,
+                max_seq_length=self.config.max_seq_length,
+                archive=self.config.archive,
+                archive_format=self.config.archive_format,
+                builder_name="llm:cpm-llm-builder",
+                embedder=self.embedder,
+                incremental_enabled=True,
+                extra_files=[CHUNK_CACHE_NAME],
+                extra_manifest={
+                    "llm_builder": {
+                        "llm_calls": llm_calls,
+                        "file_cache_hits": file_cache_hits,
+                        "segment_cache_hits": segment_cache_hits,
+                    }
+                },
+            )
+        )
+        if manifest is None:
             return None
-
-        cache_pack = _load_existing_cache(
-            out_root,
-            model_name=self.config.model_name,
-            max_seq_length=self.config.max_seq_length,
-        )
-        cache_vecs: dict[str, np.ndarray] = {}
-        cache_dim: Optional[int] = None
-        if cache_pack:
-            cache_vecs, cache_dim = cache_pack
-            self._log("embed-cache", f"enabled cached_vectors={len(cache_vecs)} dim={cache_dim}")
-        else:
-            self._log("embed-cache", "disabled no compatible previous build found")
-
-        new_hashes = [_chunk_hash(chunk.text) for chunk in chunks]
-        prev_set = set(cache_vecs.keys())
-        new_set = set(new_hashes)
-        removed = len(prev_set - new_set) if cache_vecs else 0
-        reused = sum(1 for hsh in new_hashes if hsh in cache_vecs)
-
-        to_embed_idx: list[int] = []
-        to_embed_texts: list[str] = []
-        for idx, hsh in enumerate(new_hashes):
-            if hsh not in cache_vecs:
-                to_embed_idx.append(idx)
-                to_embed_texts.append(chunks[idx].text)
-        self._log(
-            "embed-cache",
-            f"new_chunks={len(chunks)} reused={reused} to_embed={len(to_embed_idx)} removed={removed}",
-        )
-
-        if not self.embedder.health():
-            print(
-                f"[error] embedding server not reachable at {self.config.embed_url} (mode={self.config.embeddings_mode})"
-            )
-            return None
-
-        vec_missing: Optional[np.ndarray] = None
-        dim: Optional[int] = cache_dim
-        if to_embed_texts:
-            vec_missing = self.embedder.embed_texts(
-                to_embed_texts,
-                model_name=self.config.model_name,
-                max_seq_length=self.config.max_seq_length,
-                normalize=True,
-                dtype="float32",
-                show_progress=True,
-            )
-            dim = int(vec_missing.shape[1])
-        elif dim is None and chunks:
-            vec_missing = self.embedder.embed_texts(
-                [chunks[0].text],
-                model_name=self.config.model_name,
-                max_seq_length=self.config.max_seq_length,
-                normalize=True,
-                dtype="float32",
-                show_progress=False,
-            )
-            dim = int(vec_missing.shape[1])
-            to_embed_idx = [0]
-        assert dim is not None
-
-        if cache_dim is not None and cache_dim != dim:
-            cache_vecs = {}
-            reused = 0
-            to_embed_idx = list(range(len(chunks)))
-            to_embed_texts = [chunk.text for chunk in chunks]
-            vec_missing = self.embedder.embed_texts(
-                to_embed_texts,
-                model_name=self.config.model_name,
-                max_seq_length=self.config.max_seq_length,
-                normalize=True,
-                dtype="float32",
-                show_progress=True,
-            )
-            dim = int(vec_missing.shape[1])
-
-        final_vecs = np.empty((len(chunks), dim), dtype=np.float32)
-        if cache_vecs:
-            for idx, hsh in enumerate(new_hashes):
-                vector = cache_vecs.get(hsh)
-                if vector is not None:
-                    final_vecs[idx] = vector
-        if to_embed_idx:
-            assert vec_missing is not None
-            for miss_idx, chunk_idx in enumerate(to_embed_idx):
-                final_vecs[chunk_idx] = vec_missing[miss_idx]
-
-        docs_path = out_root / "docs.jsonl"
-        write_docs_jsonl(chunks, docs_path)
-        self._log("write", f"docs_jsonl={docs_path} lines={len(chunks)}")
-        db = FaissFlatIP(dim=dim)
-        db.add(final_vecs)
-        db_path = out_root / "faiss" / "index.faiss"
-        db.save(str(db_path))
-        self._log("write", f"faiss_index={db_path} ntotal={db.index.ntotal}")
-        vectors_path = out_root / "vectors.f16.bin"
-        write_vectors_f16(final_vecs, vectors_path)
-        self._log("write", f"vectors={vectors_path} shape={final_vecs.shape}")
-
-        tags = _infer_tags(ext_counts)
-        _write_cpm_yml(
-            out_root,
-            name=out_root.name,
-            version=self.config.version,
-            description=source_path.as_posix(),
-            tags=tags,
-            entrypoints=["query"],
-            embedding_model=self.config.model_name,
-            embedding_dim=dim,
-            embedding_normalized=True,
-        )
-
-        manifest = PacketManifest(
-            schema_version="1.0",
-            packet_id=out_root.name,
-            embedding=EmbeddingSpec(
-                provider="sentence-transformers",
-                model=self.config.model_name,
-                dim=dim,
-                dtype="float16",
-                normalized=True,
-                max_seq_length=self.config.max_seq_length,
-            ),
-            similarity={
-                "space": "cosine",
-                "index_type": "faiss.IndexFlatIP",
-                "notes": "cosine via inner product on normalized vectors",
-            },
-            files={
-                "docs": "docs.jsonl",
-                "vectors": {"path": "vectors.f16.bin", "format": "f16_rowmajor"},
-                "index": {"path": "faiss/index.faiss", "format": "faiss"},
-                "chunk_cache": CHUNK_CACHE_NAME,
-                "calibration": None,
-            },
-            counts={"docs": len(chunks), "vectors": int(db.index.ntotal)},
-            source={"input_dir": source_path.as_posix(), "file_ext_counts": ext_counts},
-            cpm={
-                "name": out_root.name,
-                "version": self.config.version,
-                "tags": tags,
-                "entrypoints": ["query"],
-            },
-            incremental={
-                "enabled": bool(cache_pack or cache.files),
-                "reused": reused,
-                "embedded": len(to_embed_idx),
-                "removed": removed,
+        manifest.files["chunk_cache"] = CHUNK_CACHE_NAME
+        manifest.incremental.update(
+            {
                 "file_cache_hits": file_cache_hits,
                 "segment_cache_hits": segment_cache_hits,
                 "llm_calls": llm_calls,
-            },
+            }
         )
-        manifest.checksums = compute_checksums(
-            out_root,
-            ["cpm.yml", "docs.jsonl", "vectors.f16.bin", "faiss/index.faiss", CHUNK_CACHE_NAME],
-        )
-        manifest_path = out_root / "manifest.json"
-        write_manifest(manifest, manifest_path)
-        self._log("write", f"manifest={manifest_path}")
-
-        if self.config.archive:
-            archive_path = _archive_packet_dir(out_root, self.config.archive_format)
-            self._log("write", f"archive={archive_path}")
+        (out_root / "manifest.json").write_text(json.dumps(manifest.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
         self._log("done", "build ok")
         return manifest

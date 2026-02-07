@@ -6,7 +6,7 @@ import json
 import os
 from argparse import ArgumentParser
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 
 from cpm_builtin.embeddings import EmbeddingClient, EmbeddingsConfigService
 from cpm_builtin.packages import PackageManager, parse_package_spec
@@ -20,6 +20,73 @@ DEFAULT_RETRIEVER = "native-retriever"
 _CONFIG_RETRIEVER_KEYS = ("retriever", "query_retriever", "default_retriever")
 DEFAULT_EMBED_URL = "http://127.0.0.1:8876"
 DEFAULT_EMBED_MODE = "http"
+DEFAULT_INDEXER = "faiss-flatip"
+DEFAULT_RERANKER = "none"
+
+
+class RetrievalIndexer(Protocol):
+    def search(self, *, index: Any, vector: Any, k: int) -> tuple[Any, Any]:
+        ...
+
+
+class RetrievalReranker(Protocol):
+    def rerank(self, *, query: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
+        ...
+
+
+class FaissFlatIPIndexer:
+    def search(self, *, index: Any, vector: Any, k: int) -> tuple[Any, Any]:
+        return index.search(vector, max(int(k), 1))
+
+
+class NoopReranker:
+    def rerank(self, *, query: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
+        del query
+        return hits[: max(int(k), 1)]
+
+
+class TokenDiversityReranker:
+    def rerank(self, *, query: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
+        del query
+        target = max(int(k), 1)
+        chosen: list[dict[str, Any]] = []
+        seen_tokens: set[str] = set()
+        for hit in hits:
+            text = str(hit.get("text", ""))
+            tokens = {token for token in text.lower().split() if len(token) > 3}
+            if not chosen:
+                chosen.append(hit)
+                seen_tokens.update(tokens)
+            else:
+                novelty = len(tokens - seen_tokens)
+                if novelty > 0 or len(chosen) < target // 2:
+                    chosen.append(hit)
+                    seen_tokens.update(tokens)
+            if len(chosen) >= target:
+                break
+        if len(chosen) < target:
+            for hit in hits:
+                if hit in chosen:
+                    continue
+                chosen.append(hit)
+                if len(chosen) >= target:
+                    break
+        return chosen
+
+
+_INDEXERS: dict[str, RetrievalIndexer] = {DEFAULT_INDEXER: FaissFlatIPIndexer()}
+_RERANKERS: dict[str, RetrievalReranker] = {
+    DEFAULT_RERANKER: NoopReranker(),
+    "token-diversity": TokenDiversityReranker(),
+}
+
+
+def register_retriever_indexer(name: str, indexer: RetrievalIndexer) -> None:
+    _INDEXERS[str(name).strip()] = indexer
+
+
+def register_retriever_reranker(name: str, reranker: RetrievalReranker) -> None:
+    _RERANKERS[str(name).strip()] = reranker
 
 
 @cpmretriever(name=DEFAULT_RETRIEVER, group="cpm")
@@ -35,6 +102,24 @@ class NativeFaissRetriever(CPMAbstractRetriever):
         cpm_dir = Path(str(kwargs.get("cpm_dir") or ".cpm"))
         embed_url = str(kwargs.get("embed_url") or os.environ.get("RAG_EMBED_URL") or DEFAULT_EMBED_URL)
         embed_mode = str(kwargs.get("embed_mode") or os.environ.get("RAG_EMBED_MODE") or DEFAULT_EMBED_MODE)
+        indexer_name = str(kwargs.get("indexer") or DEFAULT_INDEXER).strip()
+        reranker_name = str(kwargs.get("reranker") or DEFAULT_RERANKER).strip()
+        indexer = _INDEXERS.get(indexer_name)
+        reranker = _RERANKERS.get(reranker_name)
+        if indexer is None:
+            return {
+                "ok": False,
+                "error": "invalid_indexer",
+                "detail": f"indexer '{indexer_name}' is not registered",
+                "available_indexers": sorted(_INDEXERS.keys()),
+            }
+        if reranker is None:
+            return {
+                "ok": False,
+                "error": "invalid_reranker",
+                "detail": f"reranker '{reranker_name}' is not registered",
+                "available_rerankers": sorted(_RERANKERS.keys()),
+            }
         packet_dir = self._resolve_packet_dir(cpm_dir, packet)
         if packet_dir is None:
             return {
@@ -112,7 +197,7 @@ class NativeFaissRetriever(CPMAbstractRetriever):
                 dtype="float32",
                 show_progress=False,
             )
-            scores, ids = index.search(vector, max(int(k), 1))
+            scores, ids = indexer.search(index=index, vector=vector, k=max(int(k), 1))
         except FileNotFoundError:
             return {
                 "ok": False,
@@ -144,6 +229,7 @@ class NativeFaissRetriever(CPMAbstractRetriever):
                 }
             )
 
+        reranked_hits = reranker.rerank(query=query, hits=hits, k=int(k))
         return {
             "ok": True,
             "packet": packet_dir.name,
@@ -156,7 +242,9 @@ class NativeFaissRetriever(CPMAbstractRetriever):
                 "embed_url": embed_url,
                 "mode": embed_mode,
             },
-            "results": hits,
+            "indexer": indexer_name,
+            "reranker": reranker_name,
+            "results": reranked_hits,
         }
 
     @staticmethod
@@ -205,6 +293,8 @@ class QueryCommand(_WorkspaceAwareCommand):
         parser.add_argument("--query", required=True, help="Query text")
         parser.add_argument("-k", type=int, default=5, help="Number of results to retrieve")
         parser.add_argument("--retriever", help="Retriever name or group:name")
+        parser.add_argument("--indexer", default=DEFAULT_INDEXER, help="Indexer strategy")
+        parser.add_argument("--reranker", default=DEFAULT_RERANKER, help="Reranker strategy")
         parser.add_argument("--embed-url", help="Embedding server URL override")
         parser.add_argument(
             "--embeddings-mode",
@@ -243,6 +333,8 @@ class QueryCommand(_WorkspaceAwareCommand):
             cpm_dir=workspace_root,
             embed_url=resolved_embed_url,
             embed_mode=resolved_embed_mode,
+            indexer=str(getattr(argv, "indexer", DEFAULT_INDEXER)),
+            reranker=str(getattr(argv, "reranker", DEFAULT_RERANKER)),
         )
 
         if getattr(argv, "format", "text") == "json":
@@ -308,6 +400,8 @@ class QueryCommand(_WorkspaceAwareCommand):
         cpm_dir: Path,
         embed_url: str | None,
         embed_mode: str | None,
+        indexer: str,
+        reranker: str,
     ) -> dict[str, Any]:
         retriever = entry.target()
         call_attempts = (
@@ -318,6 +412,8 @@ class QueryCommand(_WorkspaceAwareCommand):
                 cpm_dir=str(cpm_dir),
                 embed_url=embed_url,
                 embed_mode=embed_mode,
+                indexer=indexer,
+                reranker=reranker,
             ),
             lambda: retriever.retrieve(query, k=k, packet=packet),
             lambda: retriever.retrieve(query, k=k),
@@ -383,7 +479,8 @@ class QueryCommand(_WorkspaceAwareCommand):
             return
 
         print(
-            f"[cpm:query] retriever={retriever_name} packet={payload.get('packet')} k={payload.get('k')}"
+            f"[cpm:query] retriever={retriever_name} packet={payload.get('packet')} k={payload.get('k')} "
+            f"indexer={payload.get('indexer', DEFAULT_INDEXER)} reranker={payload.get('reranker', DEFAULT_RERANKER)}"
         )
         for index, item in enumerate(payload.get("results", []), start=1):
             score = item.get("score")
@@ -403,6 +500,8 @@ def _normalize_payload(raw: Any, *, packet: str, query: str, k: int) -> dict[str
         payload.setdefault("packet", packet)
         payload.setdefault("query", query)
         payload.setdefault("k", k)
+        payload.setdefault("indexer", DEFAULT_INDEXER)
+        payload.setdefault("reranker", DEFAULT_RERANKER)
         results = payload.get("results")
         if isinstance(results, list):
             payload["results"] = [_normalize_hit(item) for item in results]
@@ -416,6 +515,8 @@ def _normalize_payload(raw: Any, *, packet: str, query: str, k: int) -> dict[str
             "packet": packet,
             "query": query,
             "k": k,
+            "indexer": DEFAULT_INDEXER,
+            "reranker": DEFAULT_RERANKER,
             "results": [_normalize_hit(item) for item in raw],
         }
 
@@ -424,6 +525,8 @@ def _normalize_payload(raw: Any, *, packet: str, query: str, k: int) -> dict[str
         "packet": packet,
         "query": query,
         "k": k,
+        "indexer": DEFAULT_INDEXER,
+        "reranker": DEFAULT_RERANKER,
         "results": [
             {
                 "score": None,
