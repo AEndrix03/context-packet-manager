@@ -12,6 +12,7 @@ from cpm_builtin.embeddings import EmbeddingClient, EmbeddingsConfigService
 from cpm_builtin.packages import PackageManager, parse_package_spec
 from cpm_builtin.packages.layout import version_dir
 from cpm_core.api import CPMAbstractRetriever, cpmcommand, cpmretriever
+from cpm_core.oci import read_install_lock, write_install_lock
 from cpm_core.registry import CPMRegistryEntry, FeatureRegistry
 
 from .commands import _WorkspaceAwareCommand
@@ -156,7 +157,7 @@ class NativeFaissRetriever(CPMAbstractRetriever):
 
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         embedding_cfg = manifest.get("embedding") or {}
-        model_name = str(embedding_cfg.get("model") or "").strip()
+        model_name = str(kwargs.get("selected_model") or embedding_cfg.get("model") or "").strip()
         if not model_name:
             return {
                 "ok": False,
@@ -313,9 +314,15 @@ class QueryCommand(_WorkspaceAwareCommand):
         workspace_root = self._resolve(requested_dir)
         self.workspace_root = workspace_root
 
-        requested = self._requested_retriever(argv, workspace_root)
+        packet_name = str(getattr(argv, "packet", "")).strip()
+        install_lock = self._ensure_install_lock(workspace_root, packet_name)
+        requested = self._requested_retriever(argv, workspace_root, install_lock=install_lock)
         entries = self._load_retriever_entries(workspace_root)
         entry = self._resolve_retriever_entry(entries, requested)
+        if entry is None and install_lock and install_lock.get("suggested_retriever"):
+            suggested = str(install_lock.get("suggested_retriever")).strip()
+            print(f"[cpm:query] downgrade: suggested retriever '{suggested}' unavailable, using default")
+            entry = self._resolve_retriever_entry(entries, DEFAULT_RETRIEVER)
         if entry is None:
             return 1
 
@@ -335,6 +342,7 @@ class QueryCommand(_WorkspaceAwareCommand):
             embed_mode=resolved_embed_mode,
             indexer=str(getattr(argv, "indexer", DEFAULT_INDEXER)),
             reranker=str(getattr(argv, "reranker", DEFAULT_RERANKER)),
+            selected_model=str(install_lock.get("selected_model")) if install_lock else None,
         )
 
         if getattr(argv, "format", "text") == "json":
@@ -344,10 +352,18 @@ class QueryCommand(_WorkspaceAwareCommand):
         self._print_text(payload, retriever_name=entry.qualified_name)
         return 0 if payload.get("ok", True) else 1
 
-    def _requested_retriever(self, argv: Any, workspace_root: Path) -> str:
+    def _requested_retriever(
+        self,
+        argv: Any,
+        workspace_root: Path,
+        *,
+        install_lock: dict[str, Any] | None,
+    ) -> str:
         explicit = getattr(argv, "retriever", None)
         if explicit:
             return str(explicit)
+        if install_lock and install_lock.get("suggested_retriever"):
+            return str(install_lock.get("suggested_retriever"))
         for key in _CONFIG_RETRIEVER_KEYS:
             configured = self.resolver.resolve_setting(key, start_dir=workspace_root)
             if configured:
@@ -402,6 +418,7 @@ class QueryCommand(_WorkspaceAwareCommand):
         embed_mode: str | None,
         indexer: str,
         reranker: str,
+        selected_model: str | None,
     ) -> dict[str, Any]:
         retriever = entry.target()
         call_attempts = (
@@ -414,6 +431,7 @@ class QueryCommand(_WorkspaceAwareCommand):
                 embed_mode=embed_mode,
                 indexer=indexer,
                 reranker=reranker,
+                selected_model=selected_model,
             ),
             lambda: retriever.retrieve(query, k=k, packet=packet),
             lambda: retriever.retrieve(query, k=k),
@@ -465,6 +483,60 @@ class QueryCommand(_WorkspaceAwareCommand):
         if not resolved_mode:
             resolved_mode = str(default_provider.type).strip().lower() or DEFAULT_EMBED_MODE
         return resolved_url, resolved_mode
+
+    def _ensure_install_lock(self, workspace_root: Path, packet_name: str) -> dict[str, Any] | None:
+        if not packet_name:
+            return None
+        existing = read_install_lock(workspace_root, packet_name)
+        if existing:
+            return existing
+
+        packet_dir = self._resolve_packet_dir_for_lock(workspace_root, packet_name)
+        if packet_dir is None:
+            return None
+        manifest_path = packet_dir / "manifest.json"
+        if not manifest_path.exists():
+            return None
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        embedding = manifest.get("embedding") if isinstance(manifest.get("embedding"), dict) else {}
+        model_name = str(embedding.get("model") or "").strip()
+        if not model_name:
+            return None
+        suggested = None
+        extras = manifest.get("extras")
+        if isinstance(extras, dict):
+            suggested = extras.get("suggested_retriever")
+        if suggested is None:
+            suggested = manifest.get("suggested_retriever")
+        default_provider = EmbeddingsConfigService(workspace_root).default_provider()
+        payload = {
+            "name": packet_name,
+            "version": packet_dir.name,
+            "selected_model": model_name,
+            "selected_provider": default_provider.name if default_provider else None,
+            "suggested_retriever": str(suggested).strip() if suggested else None,
+            "auto_resolved_by_query": True,
+        }
+        write_install_lock(workspace_root, packet_name, payload)
+        return payload
+
+    def _resolve_packet_dir_for_lock(self, workspace_root: Path, packet: str) -> Path | None:
+        direct = Path(packet)
+        if direct.is_dir():
+            return direct.resolve()
+        if direct.exists():
+            return direct.parent.resolve()
+
+        manager = PackageManager(workspace_root)
+        try:
+            name, version = parse_package_spec(packet)
+            resolved = manager.resolve_version(name, version)
+            return version_dir(workspace_root, name, resolved)
+        except Exception:
+            return None
 
     def _print_text(self, payload: dict[str, Any], *, retriever_name: str) -> None:
         if not payload.get("ok", True):
