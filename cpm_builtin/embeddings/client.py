@@ -33,6 +33,7 @@ class EmbeddingClient:
     mode: str = "http"
     timeout_s: float | None = None
     max_retries: int = 2
+    input_size: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "mode", _normalize_mode(self.mode))
@@ -66,6 +67,8 @@ class EmbeddingClient:
             max_retries=self.max_retries,
         )
         payload_texts = list(texts)
+        if not payload_texts:
+            return np.zeros((0, 0), dtype=np.float16 if dtype.lower() == "float16" else np.float32)
 
         def _embed_batch(items: list[str]) -> np.ndarray:
             response = client.embed_texts(
@@ -77,29 +80,34 @@ class EmbeddingClient:
             )
             return np.asarray(response.vectors, dtype=np.float32)
 
-        try:
-            array = _embed_batch(payload_texts)
-        except ValueError as exc:
+        def _should_shrink(exc: Exception) -> bool:
             message = str(exc).lower()
-            too_many_items = "too many input items" in message or "invalid_input" in message
-            if not too_many_items or len(payload_texts) <= 1:
-                raise
+            return (
+                "too many input items" in message
+                or "invalid_input" in message
+                or "timed out" in message
+                or "timeout" in message
+                or "failed to obtain embeddings after retries" in message
+            )
 
-            batch_size = min(64, len(payload_texts))
-            while True:
-                pieces: list[np.ndarray] = []
-                try:
-                    for start in range(0, len(payload_texts), batch_size):
-                        batch = payload_texts[start : start + batch_size]
-                        pieces.append(_embed_batch(batch))
-                    array = np.vstack(pieces) if pieces else np.zeros((0, 0), dtype=np.float32)
-                    break
-                except ValueError as inner_exc:
-                    inner_message = str(inner_exc).lower()
-                    too_many_items = "too many input items" in inner_message or "invalid_input" in inner_message
-                    if not too_many_items or batch_size <= 1:
-                        raise
-                    batch_size = max(1, batch_size // 2)
+        configured_batch = int(self.input_size) if self.input_size is not None else 0
+        if configured_batch > 0:
+            batch_size = min(configured_batch, len(payload_texts))
+        else:
+            batch_size = len(payload_texts)
+
+        while True:
+            pieces: list[np.ndarray] = []
+            try:
+                for start in range(0, len(payload_texts), batch_size):
+                    batch = payload_texts[start : start + batch_size]
+                    pieces.append(_embed_batch(batch))
+                array = np.vstack(pieces) if pieces else np.zeros((0, 0), dtype=np.float32)
+                break
+            except Exception as exc:
+                if batch_size <= 1 or not _should_shrink(exc):
+                    raise
+                batch_size = max(1, batch_size // 2)
 
         if dtype.lower() == "float16":
             return array.astype(np.float16)

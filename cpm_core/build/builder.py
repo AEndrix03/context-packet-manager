@@ -305,6 +305,7 @@ class DefaultBuilderConfig:
     embed_url: str = DEFAULT_EMBED_URL
     embeddings_mode: str = "http"
     timeout: float | None = None
+    input_size: int | None = None
 
 
 def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest | None:
@@ -696,6 +697,7 @@ class DefaultBuilder(CPMAbstractBuilder):
             base_url=self.config.embed_url,
             mode=self.config.embeddings_mode,
             timeout_s=self.config.timeout,
+            input_size=self.config.input_size,
         )
 
     def build(self, source: str, *, destination: str | None = None) -> PacketManifest | None:

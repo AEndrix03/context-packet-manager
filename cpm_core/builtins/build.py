@@ -246,6 +246,19 @@ def _merge_invocation(argv: Any, workspace_root: Path) -> _BuildInvocation:
             ),
         ),
     )
+    cli_input_size = getattr(argv, "input_size", None)
+    input_size_value = _as_int(
+        cli_input_size,
+        _as_int(
+            embeddings_data.get("batch_size"),
+            _as_int(
+                embedding_data.get("batch_size"),
+                _as_int(default_provider.batch_size if default_provider is not None else None, None),
+            ),
+        ),
+    )
+    if input_size_value is not None and input_size_value <= 0:
+        input_size_value = None
 
     builder_config = DefaultBuilderConfig(
         model_name=model_name,
@@ -260,6 +273,7 @@ def _merge_invocation(argv: Any, workspace_root: Path) -> _BuildInvocation:
         embed_url=embed_url,
         embeddings_mode=embeddings_mode,
         timeout=timeout_value,
+        input_size=input_size_value,
     )
 
     return _BuildInvocation(
@@ -366,6 +380,7 @@ def _execute_builder(invocation: _BuildInvocation, builder_entry: CPMRegistryEnt
     setattr(argv, "embeddings_mode", invocation.config.embeddings_mode)
     setattr(argv, "max_seq_length", invocation.config.max_seq_length)
     setattr(argv, "timeout", invocation.config.timeout)
+    setattr(argv, "input_size", invocation.config.input_size)
 
     run_method = getattr(builder, "run", None)
     if callable(run_method):
@@ -436,6 +451,7 @@ class BuildCommand(_WorkspaceAwareCommand):
         parser.add_argument("--embed-url", help="Embedding server URL")
         parser.add_argument("--embeddings-mode", choices=VALID_EMBEDDING_MODES, help="Embedding transport mode")
         parser.add_argument("--timeout", type=float, help="Embedding request timeout (seconds)")
+        parser.add_argument("--input-size", type=int, help="Max input items per embedding request")
         parser.add_argument("--lockfile", default=DEFAULT_LOCKFILE_NAME, help="Lockfile name inside packet directory")
         parser.add_argument("--frozen-lockfile", action="store_true", help="Require an up-to-date deterministic lockfile")
         parser.add_argument("--update-lock", action="store_true", help="Regenerate lockfile from current inputs/config")
@@ -453,6 +469,7 @@ class BuildCommand(_WorkspaceAwareCommand):
         parser.add_argument("--embed-url", help="Embedding server URL")
         parser.add_argument("--embeddings-mode", choices=VALID_EMBEDDING_MODES, help="Embedding transport mode")
         parser.add_argument("--timeout", type=float, help="Embedding request timeout (seconds)")
+        parser.add_argument("--input-size", type=int, help="Max input items per embedding request")
         parser.add_argument("--lockfile", default=DEFAULT_LOCKFILE_NAME, help="Lockfile name inside packet directory")
         parser.add_argument("--update-lock", action="store_true", help="Update lockfile artifact hashes if present")
 
@@ -526,6 +543,7 @@ class BuildCommand(_WorkspaceAwareCommand):
                 invocation.config.embed_url,
                 mode=invocation.config.embeddings_mode,
                 timeout_s=invocation.config.timeout,
+                input_size=invocation.config.input_size,
             )
             manifest = embed_packet_from_chunks(
                 packet_dir,

@@ -114,6 +114,7 @@ class LLMBuilderRuntimeConfig:
     embed_url: str
     embeddings_mode: str
     timeout: float | None
+    input_size: int | None
 
 
 @cpmbuilder(name="cpm-llm-builder", group="llm")
@@ -154,6 +155,7 @@ class CPMLLMBuilder(CPMAbstractBuilder):
         parser.add_argument("--embed-url", default=DEFAULT_EMBED_URL, help="Embedding endpoint URL")
         parser.add_argument("--embeddings-mode", choices=["http", "legacy"], default="http")
         parser.add_argument("--timeout", type=float, default=None, help="Embedding request timeout in seconds")
+        parser.add_argument("--input-size", type=int, default=None, help="Max input items per embedding request")
         parser.add_argument("--archive", dest="archive", action="store_true", help="Create archive output")
         parser.add_argument("--no-archive", dest="archive", action="store_false", help="Skip archive output")
         parser.set_defaults(archive=True)
@@ -201,12 +203,14 @@ class CPMLLMBuilder(CPMAbstractBuilder):
             embed_url=str(getattr(args, "embed_url", None) or DEFAULT_EMBED_URL),
             embeddings_mode=str(getattr(args, "embeddings_mode", None) or "http"),
             timeout=getattr(args, "timeout", None),
+            input_size=(int(getattr(args, "input_size", None)) if getattr(args, "input_size", None) else None),
         )
         self.config = runtime
         self.embedder = self.embedder or EmbeddingClient(
             base_url=runtime.embed_url,
             mode=runtime.embeddings_mode,
             timeout_s=runtime.timeout,
+            input_size=runtime.input_size,
         )
         manifest = self.build(str(getattr(args, "source")), destination=str(getattr(args, "destination")))
         return 0 if manifest is not None else 1
