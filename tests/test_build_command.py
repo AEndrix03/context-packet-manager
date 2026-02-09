@@ -548,3 +548,12 @@ def test_build_persists_docs_even_when_embedder_unreachable(tmp_path: Path, monk
     assert result == 1
     packet_dir = tmp_path / "dist" / "docs" / "0.0.9"
     assert (packet_dir / "docs.jsonl").exists()
+    assert (packet_dir / "cpm.yml").exists()
+    manifest = load_manifest(packet_dir / "manifest.json")
+    assert manifest.cpm["name"] == "docs"
+    assert manifest.cpm["version"] == "0.0.9"
+    assert manifest.embedding.model == DefaultBuilderConfig().model_name
+    assert manifest.embedding.dim == 0
+    assert manifest.counts["docs"] >= 1
+    assert manifest.counts["vectors"] == 0
+    assert manifest.extras.get("build_status") == "embedding_failed"

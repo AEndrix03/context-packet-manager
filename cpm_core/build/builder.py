@@ -319,6 +319,71 @@ def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest
     docs_path = out_root / "docs.jsonl"
     write_docs_jsonl(chunks, docs_path)
     print(f"[write] docs.jsonl -> {docs_path} ({len(chunks)} lines)")
+    tags = _infer_tags(dict(input_data.ext_counts))
+
+    def _write_partial_metadata(*, reason: str) -> PacketManifest:
+        _write_cpm_yml(
+            out_root,
+            name=input_data.packet_name,
+            version=input_data.packet_version,
+            description=input_data.description,
+            tags=tags,
+            entrypoints=["query"],
+            embedding_model=input_data.model_name,
+            embedding_dim=0,
+            embedding_normalized=True,
+        )
+        manifest = PacketManifest(
+            schema_version="1.0",
+            packet_id=input_data.packet_name,
+            embedding=EmbeddingSpec(
+                provider="sentence-transformers",
+                model=input_data.model_name,
+                dim=0,
+                dtype="float16",
+                normalized=True,
+                max_seq_length=input_data.max_seq_length,
+            ),
+            similarity={
+                "space": "cosine",
+                "index_type": "faiss.IndexFlatIP",
+                "notes": "vectors/index not materialized",
+            },
+            files={
+                "docs": "docs.jsonl",
+                "vectors": None,
+                "index": None,
+                "calibration": None,
+            },
+            counts={"docs": len(chunks), "vectors": 0},
+            source={
+                "input_dir": input_data.source_path.as_posix(),
+                "file_ext_counts": dict(input_data.ext_counts),
+            },
+            cpm={
+                "name": input_data.packet_name,
+                "version": input_data.packet_version,
+                "description": input_data.description,
+                "tags": tags,
+                "entrypoints": ["query"],
+                "builder": input_data.builder_name,
+            },
+            incremental={
+                "enabled": bool(cache_pack),
+                "reused": 0,
+                "embedded": 0,
+                "removed": 0,
+            },
+            extras={"build_status": "embedding_failed", "build_error": reason},
+        )
+        if input_data.extra_manifest:
+            manifest.extras.update(dict(input_data.extra_manifest))
+        checksum_targets = ["cpm.yml", "docs.jsonl", *input_data.extra_files]
+        manifest.checksums = compute_checksums(out_root, checksum_targets)
+        manifest_path = out_root / "manifest.json"
+        write_manifest(manifest, manifest_path)
+        print(f"[write] manifest.json -> {manifest_path}")
+        return manifest
 
     cache_pack = None
     if input_data.incremental_enabled:
@@ -354,31 +419,37 @@ def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest
 
     if not input_data.embedder.health():
         print("[error] embedding server is not reachable")
+        _write_partial_metadata(reason="embedding server is not reachable")
         return None
 
     vec_missing: Optional[np.ndarray] = None
     dim: Optional[int] = cache_dim
-    if to_embed_texts:
-        vec_missing = input_data.embedder.embed_texts(
-            to_embed_texts,
-            model_name=input_data.model_name,
-            max_seq_length=input_data.max_seq_length,
-            normalize=True,
-            dtype="float32",
-            show_progress=True,
-        )
-        dim = int(vec_missing.shape[1])
-    elif dim is None and chunks:
-        vec_missing = input_data.embedder.embed_texts(
-            [chunks[0].text],
-            model_name=input_data.model_name,
-            max_seq_length=input_data.max_seq_length,
-            normalize=True,
-            dtype="float32",
-            show_progress=False,
-        )
-        dim = int(vec_missing.shape[1])
-        to_embed_idx = [0]
+    try:
+        if to_embed_texts:
+            vec_missing = input_data.embedder.embed_texts(
+                to_embed_texts,
+                model_name=input_data.model_name,
+                max_seq_length=input_data.max_seq_length,
+                normalize=True,
+                dtype="float32",
+                show_progress=True,
+            )
+            dim = int(vec_missing.shape[1])
+        elif dim is None and chunks:
+            vec_missing = input_data.embedder.embed_texts(
+                [chunks[0].text],
+                model_name=input_data.model_name,
+                max_seq_length=input_data.max_seq_length,
+                normalize=True,
+                dtype="float32",
+                show_progress=False,
+            )
+            dim = int(vec_missing.shape[1])
+            to_embed_idx = [0]
+    except Exception as exc:
+        print(f"[error] embedding request failed: {exc}")
+        _write_partial_metadata(reason=f"embedding request failed: {exc}")
+        return None
 
     assert dim is not None
 
@@ -420,7 +491,6 @@ def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest
     write_vectors_f16(final_vecs, vectors_path)
     print(f"[write] vectors.f16.bin -> {vectors_path}")
 
-    tags = _infer_tags(dict(input_data.ext_counts))
     _write_cpm_yml(
         out_root,
         name=input_data.packet_name,
