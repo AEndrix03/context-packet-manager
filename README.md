@@ -218,7 +218,20 @@ cpm build \
   --embed-url http://127.0.0.1:8876
 ```
 
-`--packet-version` remains supported as a compatibility alias, but `--version` is preferred.
+```bash
+# 4) Migrate to a different embedder/model using workspace default provider
+# (embed URL is resolved from .cpm/config/embeddings.yml default provider)
+cpm build \
+  --source C:\path\to\repo \
+  --builder llm:cpm-llm-builder \
+  --name repo-packet \
+  --version 0.0.1 \
+  --model intfloat/multilingual-e5-base
+```
+
+Notes:
+- `--packet-version` remains supported as a compatibility alias, but `--version` is preferred.
+- `--source` and `--builder` are still required for deterministic rebuilds: chunk generation depends on builder behavior and source content.
 
 **Output:**
 

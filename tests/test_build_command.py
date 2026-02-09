@@ -399,3 +399,61 @@ def test_build_command_accepts_version_alias(tmp_path: Path, monkeypatch) -> Non
     packet_dir = tmp_path / "dist" / "docs" / "2.0.0"
     manifest = load_manifest(packet_dir / "manifest.json")
     assert manifest.cpm["version"] == "2.0.0"
+
+
+def test_build_command_uses_default_provider_from_embeddings_config(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "docs"
+    project.mkdir()
+    (project / "intro.md").write_text("Welcome\nThis is a sample project\nEnd", encoding="utf-8")
+    config_dir = tmp_path / ".cpm" / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "embeddings.yml").write_text(
+        (
+            "default: local\n"
+            "providers:\n"
+            "  local:\n"
+            "    type: http\n"
+            "    url: http://embed.local:9999\n"
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(tmp_path)
+
+    def fake_health(self):
+        return self.base_url == "http://embed.local:9999"
+
+    monkeypatch.setattr("cpm_builtin.embeddings.client.EmbeddingClient.health", fake_health)
+
+    def fake_embed_texts(
+        self,
+        texts,
+        *,
+        model_name: str,
+        max_seq_length: int,
+        normalize: bool,
+        dtype: str,
+        show_progress: bool,
+    ):
+        vectors = [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+        return np.asarray(vectors, dtype=np.float32)
+
+    monkeypatch.setattr(
+        "cpm_builtin.embeddings.client.EmbeddingClient.embed_texts",
+        fake_embed_texts,
+    )
+
+    result = cli_main(
+        [
+            "build",
+            "run",
+            "--source",
+            "docs",
+            "--name",
+            "docs",
+            "--version",
+            "3.0.0",
+        ],
+        start_dir=tmp_path,
+    )
+    assert result == 0

@@ -320,7 +320,17 @@ cpm build --source C:\path\to\repo --builder llm:cpm-llm-builder \
   --embed-url http://127.0.0.1:8876
 ```
 
+### Example 1d: Migrate Embedder via Default Provider
+
+```bash
+# embed URL comes from .cpm/config/embeddings.yml default provider
+cpm build --source C:\path\to\repo --builder llm:cpm-llm-builder \
+  --name repo-packet --version 0.0.1 \
+  --model intfloat/multilingual-e5-base
+```
+
 `--packet-version` is still supported as a compatibility alias.
+`--source` and `--builder` remain required because packet chunking is builder-specific.
 
 ### Example 2: Programmatic Build
 

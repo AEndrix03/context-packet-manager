@@ -12,6 +12,7 @@ from typing import Any
 
 from cpm_core.api import cpmcommand
 from cpm_builtin.embeddings import VALID_EMBEDDING_MODES
+from cpm_builtin.embeddings.config import EmbeddingsConfigService
 from cpm_core.build import DefaultBuilder, DefaultBuilderConfig
 from cpm_core.packet import (
     DEFAULT_LOCKFILE_NAME,
@@ -121,6 +122,28 @@ class _BuildInvocation:
     builder: str
 
 
+def _resolve_default_embedding_provider(workspace_root: Path) -> Any:
+    candidates = [workspace_root, workspace_root / "config"]
+    if workspace_root.name == ".cpm":
+        candidates.extend([workspace_root.parent, workspace_root.parent / ".cpm" / "config"])
+    else:
+        candidates.extend([workspace_root / ".cpm", workspace_root / ".cpm" / "config"])
+
+    seen: set[Path] = set()
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            provider = EmbeddingsConfigService(resolved).default_provider()
+        except Exception:
+            provider = None
+        if provider is not None:
+            return provider
+    return None
+
+
 def _merge_invocation(argv: Any, workspace_root: Path) -> _BuildInvocation:
     config_path = Path(argv.config) if getattr(argv, "config", None) else workspace_root / "config" / BUILD_CONFIG_FILE
     config_data = _load_build_config(config_path)
@@ -183,6 +206,8 @@ def _merge_invocation(argv: Any, workspace_root: Path) -> _BuildInvocation:
     if archive_format not in SUPPORTED_ARCHIVE_FORMATS:
         archive_format = DefaultBuilderConfig().archive_format
 
+    default_provider = _resolve_default_embedding_provider(workspace_root)
+
     cli_embed_url = getattr(argv, "embed_url", None)
     embed_url = _as_str(
         cli_embed_url,
@@ -190,25 +215,35 @@ def _merge_invocation(argv: Any, workspace_root: Path) -> _BuildInvocation:
             embeddings_data.get("url")
             or embeddings_data.get("embed_url")
             or embedding_data.get("embed_url"),
-            os.environ.get("RAG_EMBED_URL") or DefaultBuilderConfig().embed_url,
+            _as_str(default_provider.url if default_provider is not None else None, ""),
         ),
     )
+    if not embed_url:
+        embed_url = _as_str(os.environ.get("RAG_EMBED_URL"), DefaultBuilderConfig().embed_url)
 
     cli_embeddings_mode = getattr(argv, "embeddings_mode", None)
     embeddings_mode = _as_str(
         cli_embeddings_mode,
         _as_str(
             embeddings_data.get("mode"),
-            os.environ.get("RAG_EMBED_MODE") or DefaultBuilderConfig().embeddings_mode,
+            _as_str(default_provider.type if default_provider is not None else None, ""),
         ),
     ).strip().lower()
+    if not embeddings_mode:
+        embeddings_mode = _as_str(os.environ.get("RAG_EMBED_MODE"), DefaultBuilderConfig().embeddings_mode).strip().lower()
     if embeddings_mode not in VALID_EMBEDDING_MODES:
         embeddings_mode = DefaultBuilderConfig().embeddings_mode
 
     timeout = getattr(argv, "timeout", None)
     timeout_value = _as_float(
         timeout,
-        _as_float(embeddings_data.get("timeout"), _as_float(embedding_data.get("timeout"), None)),
+        _as_float(
+            embeddings_data.get("timeout"),
+            _as_float(
+                embedding_data.get("timeout"),
+                _as_float(default_provider.resolved_http_timeout if default_provider is not None else None, None),
+            ),
+        ),
     )
 
     builder_config = DefaultBuilderConfig(
@@ -326,6 +361,10 @@ def _execute_builder(invocation: _BuildInvocation, builder_entry: CPMRegistryEnt
     setattr(argv, "name", invocation.packet_name)
     setattr(argv, "description", invocation.description)
     setattr(argv, "model_name", invocation.config.model_name)
+    setattr(argv, "embed_url", invocation.config.embed_url)
+    setattr(argv, "embeddings_mode", invocation.config.embeddings_mode)
+    setattr(argv, "max_seq_length", invocation.config.max_seq_length)
+    setattr(argv, "timeout", invocation.config.timeout)
 
     run_method = getattr(builder, "run", None)
     if callable(run_method):
