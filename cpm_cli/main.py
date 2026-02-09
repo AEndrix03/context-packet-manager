@@ -34,9 +34,6 @@ def main(
         print(f"cpm v{CLI_VERSION}")
         return 0
 
-    if tokens and tokens[0] == "embed":
-        return _run_embed_cli(tokens)
-
     app = CPMApp(start_dir=start_dir)
     app.bootstrap()
     registry = app.feature_registry
@@ -214,27 +211,6 @@ def _extract_command_spec(args: Sequence[str], qualified_names: set[str]) -> tup
             return maybe, list(rest[1:])
 
     return first, list(rest)
-
-
-def _run_embed_cli(tokens: Sequence[str]) -> int:
-    try:
-        from cpm_cli.cli import build_parser as _embed_parser
-    except Exception as exc:
-        print(f"[cpm] embed helper unavailable: {exc}")
-        return 1
-
-    parser = _embed_parser()
-    try:
-        args = parser.parse_args(tokens)
-    except SystemExit as exc:
-        return exc.code or 0
-
-    func = getattr(args, "func", None)
-    if func is None:
-        parser.print_help()
-        return 0
-    func(args)
-    return 0
 
 
 def to_int(result: int | None) -> int:
