@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import shutil
 
@@ -9,6 +10,7 @@ import numpy as np
 
 from cpm_cli import main as cli_main
 from cpm_core.build import DefaultBuilderConfig
+from cpm_core.packet import load_lock
 from cpm_core.packet.faiss_db import load_faiss_index
 from cpm_core.packet.io import (
     load_manifest,
@@ -81,6 +83,214 @@ def test_build_command_creates_packet(tmp_path: Path, monkeypatch) -> None:
     faiss_index = load_faiss_index(packet_dir / "faiss" / "index.faiss")
     scores, ids = faiss_index.search(vectors[:1], 1)
     assert ids[0][0] == 0
+
+
+def test_build_command_generates_lockfile(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "docs"
+    project.mkdir()
+    (project / "intro.md").write_text("Welcome\nThis is a sample project\nEnd", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("cpm_builtin.embeddings.client.EmbeddingClient.health", lambda self: True)
+
+    def fake_embed_texts(
+        self,
+        texts,
+        *,
+        model_name: str,
+        max_seq_length: int,
+        normalize: bool,
+        dtype: str,
+        show_progress: bool,
+    ):
+        dims = 4
+        vectors = []
+        for idx in range(len(texts)):
+            vector = [1.0 if component == idx else 0.0 for component in range(dims)]
+            vectors.append(vector)
+        return np.asarray(vectors, dtype=np.float32)
+
+    monkeypatch.setattr(
+        "cpm_builtin.embeddings.client.EmbeddingClient.embed_texts",
+        fake_embed_texts,
+    )
+
+    result = cli_main(
+        [
+            "build",
+            "run",
+            "--source",
+            "docs",
+            "--name",
+            "docs",
+            "--packet-version",
+            "1.2.3",
+        ],
+        start_dir=tmp_path,
+    )
+    assert result == 0
+
+    lock_path = tmp_path / "dist" / "docs" / "1.2.3" / "packet.lock.json"
+    assert lock_path.exists()
+    lock_payload = load_lock(lock_path)
+    assert lock_payload["packet"]["name"] == "docs"
+    assert lock_payload["packet"]["version"] == "1.2.3"
+    assert lock_payload["artifacts"]["packet_manifest_hash"]
+
+
+def test_build_command_fails_on_lock_input_mismatch(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "docs"
+    project.mkdir()
+    doc_path = project / "intro.md"
+    doc_path.write_text("first", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("cpm_builtin.embeddings.client.EmbeddingClient.health", lambda self: True)
+
+    def fake_embed_texts(
+        self,
+        texts,
+        *,
+        model_name: str,
+        max_seq_length: int,
+        normalize: bool,
+        dtype: str,
+        show_progress: bool,
+    ):
+        vectors = [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+        return np.asarray(vectors, dtype=np.float32)
+
+    monkeypatch.setattr(
+        "cpm_builtin.embeddings.client.EmbeddingClient.embed_texts",
+        fake_embed_texts,
+    )
+
+    first_result = cli_main(
+        [
+            "build",
+            "run",
+            "--source",
+            "docs",
+            "--name",
+            "docs",
+            "--packet-version",
+            "1.2.3",
+        ],
+        start_dir=tmp_path,
+    )
+    assert first_result == 0
+
+    doc_path.write_text("second", encoding="utf-8")
+    second_result = cli_main(
+        [
+            "build",
+            "run",
+            "--source",
+            "docs",
+            "--name",
+            "docs",
+            "--packet-version",
+            "1.2.3",
+        ],
+        start_dir=tmp_path,
+    )
+    assert second_result == 1
+
+    third_result = cli_main(
+        [
+            "build",
+            "run",
+            "--source",
+            "docs",
+            "--name",
+            "docs",
+            "--packet-version",
+            "1.2.3",
+            "--update-lock",
+        ],
+        start_dir=tmp_path,
+    )
+    assert third_result == 0
+
+
+def test_build_verify_detects_artifact_tampering(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "docs"
+    project.mkdir()
+    (project / "intro.md").write_text("hello", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("cpm_builtin.embeddings.client.EmbeddingClient.health", lambda self: True)
+
+    def fake_embed_texts(
+        self,
+        texts,
+        *,
+        model_name: str,
+        max_seq_length: int,
+        normalize: bool,
+        dtype: str,
+        show_progress: bool,
+    ):
+        vectors = [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+        return np.asarray(vectors, dtype=np.float32)
+
+    monkeypatch.setattr(
+        "cpm_builtin.embeddings.client.EmbeddingClient.embed_texts",
+        fake_embed_texts,
+    )
+
+    first_result = cli_main(
+        [
+            "build",
+            "run",
+            "--source",
+            "docs",
+            "--name",
+            "docs",
+            "--packet-version",
+            "1.2.3",
+        ],
+        start_dir=tmp_path,
+    )
+    assert first_result == 0
+
+    packet_dir = tmp_path / "dist" / "docs" / "1.2.3"
+    (packet_dir / "vectors.f16.bin").write_bytes(b"tampered")
+
+    verify_result = cli_main(
+        [
+            "build",
+            "verify",
+            "--source",
+            "docs",
+            "--name",
+            "docs",
+            "--packet-version",
+            "1.2.3",
+        ],
+        start_dir=tmp_path,
+    )
+    assert verify_result == 1
+
+    update_result = cli_main(
+        [
+            "build",
+            "lock",
+            "--source",
+            "docs",
+            "--name",
+            "docs",
+            "--packet-version",
+            "1.2.3",
+            "--update-lock",
+        ],
+        start_dir=tmp_path,
+    )
+    assert update_result == 0
+
+    lock_path = packet_dir / "packet.lock.json"
+    payload = json.loads(lock_path.read_text(encoding="utf-8"))
+    assert payload["artifacts"]["embeddings_hash"]
 
 
 def test_build_command_can_select_plugin_builder(tmp_path: Path, monkeypatch) -> None:

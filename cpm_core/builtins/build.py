@@ -6,13 +6,24 @@ import json
 import os
 import tomllib
 from argparse import ArgumentParser
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from cpm_core.api import cpmcommand
 from cpm_builtin.embeddings import VALID_EMBEDDING_MODES
 from cpm_core.build import DefaultBuilder, DefaultBuilderConfig
+from cpm_core.packet import (
+    DEFAULT_LOCKFILE_NAME,
+    artifact_hashes,
+    build_resolved_plan,
+    load_lock,
+    lock_has_non_deterministic_sections,
+    render_lock,
+    verify_artifacts,
+    verify_lock_against_plan,
+    write_lock,
+)
 from cpm_core.registry import AmbiguousFeatureError, CPMRegistryEntry, FeatureNotFoundError, FeatureRegistry
 from .commands import _WorkspaceAwareCommand
 
@@ -106,6 +117,7 @@ class _BuildInvocation:
     packet_version: str
     description: str
     config: DefaultBuilderConfig
+    config_payload: dict[str, Any]
     builder: str
 
 
@@ -220,6 +232,7 @@ def _merge_invocation(argv: Any, workspace_root: Path) -> _BuildInvocation:
         packet_version=packet_version,
         description=description,
         config=builder_config,
+        config_payload=config_data,
         builder=_as_str(getattr(argv, "builder", None), "cpm:default-builder"),
     )
 
@@ -247,6 +260,83 @@ def _resolve_builder_entry(spec: str, workspace_root: Path) -> CPMRegistryEntry 
     if entry.kind != "builder":
         return None
     return entry
+
+
+def _resolve_builder_plugin_version(builder_entry: CPMRegistryEntry, workspace_root: Path) -> str:
+    if builder_entry.origin == "builtin":
+        return "builtin"
+    from cpm_core.app import CPMApp
+
+    app = CPMApp(start_dir=workspace_root)
+    app.bootstrap()
+    for record in app.plugin_manager.plugin_records():
+        if record.id != builder_entry.origin:
+            continue
+        if record.manifest is not None:
+            return record.manifest.version
+        break
+    return "unknown"
+
+
+def _build_lock_plan(
+    invocation: _BuildInvocation,
+    *,
+    builder_entry: CPMRegistryEntry,
+    builder_plugin_version: str,
+) -> Any:
+    merged_config = {
+        "build_config": invocation.config_payload,
+        "resolved_config": asdict(invocation.config),
+        "builder": builder_entry.qualified_name,
+        "source": invocation.source.as_posix(),
+    }
+    return build_resolved_plan(
+        source_path=invocation.source,
+        packet_name=invocation.packet_name,
+        packet_version=invocation.packet_version,
+        packet_id=invocation.packet_name,
+        build_profile=builder_entry.qualified_name,
+        builder_plugin=builder_entry.qualified_name,
+        builder_plugin_version=builder_plugin_version,
+        config_payload=merged_config,
+        model_provider="sentence-transformers",
+        model_name=invocation.config.model_name,
+        model_dtype="float16",
+        normalize=True,
+        max_seq_length=invocation.config.max_seq_length,
+    )
+
+
+def _execute_builder(invocation: _BuildInvocation, builder_entry: CPMRegistryEntry, argv: Any) -> bool:
+    builder_cls = builder_entry.target
+    if builder_cls is DefaultBuilder:
+        builder = builder_cls(config=invocation.config)
+        manifest = builder.build(
+            str(invocation.source),
+            destination=str(invocation.packet_dir),
+        )
+        return manifest is not None
+
+    builder = builder_cls()
+    setattr(argv, "destination", str(invocation.packet_dir))
+    setattr(argv, "source", str(invocation.source))
+    setattr(argv, "packet_version", invocation.packet_version)
+    setattr(argv, "name", invocation.packet_name)
+    setattr(argv, "description", invocation.description)
+
+    run_method = getattr(builder, "run", None)
+    if callable(run_method):
+        return int(run_method(argv)) == 0
+
+    manifest = builder.build(str(invocation.source), destination=str(invocation.packet_dir))
+    if builder_entry.origin == "builtin" and manifest is None:
+        return False
+    return True
+
+
+def _print_verify_errors(errors: tuple[str, ...]) -> None:
+    for item in errors:
+        print(f"[cpm:build] {item}")
 
 
 def _update_packet_description(packet_dir: Path, description: str) -> int:
@@ -297,6 +387,9 @@ class BuildCommand(_WorkspaceAwareCommand):
         parser.add_argument("--embed-url", help="Embedding server URL")
         parser.add_argument("--embeddings-mode", choices=VALID_EMBEDDING_MODES, help="Embedding transport mode")
         parser.add_argument("--timeout", type=float, help="Embedding request timeout (seconds)")
+        parser.add_argument("--lockfile", default=DEFAULT_LOCKFILE_NAME, help="Lockfile name inside packet directory")
+        parser.add_argument("--frozen-lockfile", action="store_true", help="Require an up-to-date deterministic lockfile")
+        parser.add_argument("--update-lock", action="store_true", help="Regenerate lockfile from current inputs/config")
 
     @classmethod
     def configure(cls, parser: ArgumentParser) -> None:
@@ -308,6 +401,12 @@ class BuildCommand(_WorkspaceAwareCommand):
 
         run = sub.add_parser("run", help="Build a packet")
         cls._configure_run_options(run, required=True)
+
+        lock = sub.add_parser("lock", help="Generate or update packet lockfile without building artifacts")
+        cls._configure_run_options(lock, required=True)
+
+        verify = sub.add_parser("verify", help="Verify lockfile coherence and artifact integrity")
+        cls._configure_run_options(verify, required=True)
 
         describe = sub.add_parser("describe", help="Set or update packet description")
         describe.add_argument("--destination", default="dist", help="Destination root (default: ./dist)")
@@ -351,6 +450,7 @@ class BuildCommand(_WorkspaceAwareCommand):
             return 1
 
         invocation.destination_root.mkdir(parents=True, exist_ok=True)
+        invocation.packet_dir.mkdir(parents=True, exist_ok=True)
 
         builder_entry = _resolve_builder_entry(invocation.builder, workspace_root)
         if builder_entry is None:
@@ -360,29 +460,80 @@ class BuildCommand(_WorkspaceAwareCommand):
                 print(f"[hint] available builders: {', '.join(available)}")
             return 1
 
-        builder_cls = builder_entry.target
-        if builder_cls is DefaultBuilder:
-            builder = builder_cls(config=invocation.config)
-            manifest = builder.build(
-                str(invocation.source),
-                destination=str(invocation.packet_dir),
-            )
-            return 0 if manifest is not None else 1
+        builder_plugin_version = _resolve_builder_plugin_version(builder_entry, workspace_root)
+        plan = _build_lock_plan(
+            invocation,
+            builder_entry=builder_entry,
+            builder_plugin_version=builder_plugin_version,
+        )
 
-        builder = builder_cls()
-        setattr(argv, "destination", str(invocation.packet_dir))
-        setattr(argv, "source", str(invocation.source))
-        setattr(argv, "packet_version", invocation.packet_version)
-        setattr(argv, "name", invocation.packet_name)
-        setattr(argv, "description", invocation.description)
+        lockfile_name = str(getattr(argv, "lockfile", DEFAULT_LOCKFILE_NAME) or DEFAULT_LOCKFILE_NAME).strip()
+        if not lockfile_name:
+            lockfile_name = DEFAULT_LOCKFILE_NAME
+        lock_path = invocation.packet_dir / lockfile_name
+        frozen_lockfile = bool(getattr(argv, "frozen_lockfile", False))
+        update_lock = bool(getattr(argv, "update_lock", False))
 
-        run_method = getattr(builder, "run", None)
-        if callable(run_method):
-            return int(run_method(argv))
+        if action == "verify":
+            if not lock_path.exists():
+                print(f"[cpm:build] lockfile not found: {lock_path}")
+                return 1
+            try:
+                lock_payload = load_lock(lock_path)
+            except Exception as exc:
+                print(f"[cpm:build] unable to read lockfile: {exc}")
+                return 1
+            plan_result = verify_lock_against_plan(lock_payload, plan)
+            artifacts_result = verify_artifacts(lock_payload, invocation.packet_dir)
+            if frozen_lockfile and lock_has_non_deterministic_sections(lock_payload):
+                print("[cpm:build] lockfile contains non_deterministic sections and --frozen-lockfile is enabled")
+                return 1
+            if not plan_result.ok:
+                _print_verify_errors(plan_result.errors)
+                return 1
+            if not artifacts_result.ok:
+                _print_verify_errors(artifacts_result.errors)
+                return 1
+            print(f"[cpm:build] verify ok: {lock_path}")
+            return 0
 
-        manifest = builder.build(str(invocation.source), destination=str(invocation.packet_dir))
-        if builder_entry.origin == "builtin" and manifest is None:
+        lock_payload = None
+        if lock_path.exists():
+            try:
+                lock_payload = load_lock(lock_path)
+            except Exception as exc:
+                print(f"[cpm:build] unable to read lockfile: {exc}")
+                return 1
+            if not update_lock:
+                verify_result = verify_lock_against_plan(lock_payload, plan)
+                if not verify_result.ok:
+                    print("[cpm:build] lockfile does not match current build inputs/config; use --update-lock")
+                    _print_verify_errors(verify_result.errors)
+                    return 1
+            if frozen_lockfile and lock_has_non_deterministic_sections(lock_payload):
+                print("[cpm:build] lockfile contains non_deterministic sections and --frozen-lockfile is enabled")
+                return 1
+        elif frozen_lockfile:
+            print(f"[cpm:build] --frozen-lockfile requires an existing lockfile at {lock_path}")
             return 1
+
+        if action == "lock":
+            payload = render_lock(plan, artifacts=artifact_hashes(invocation.packet_dir))
+            write_lock(lock_path, payload)
+            print(f"[cpm:build] lockfile written: {lock_path}")
+            return 0
+
+        if lock_payload is None or update_lock:
+            payload = render_lock(plan, artifacts=artifact_hashes(invocation.packet_dir))
+            write_lock(lock_path, payload)
+
+        ok = _execute_builder(invocation, builder_entry, argv)
+        if not ok:
+            return 1
+
+        payload = render_lock(plan, artifacts=artifact_hashes(invocation.packet_dir))
+        write_lock(lock_path, payload)
+        print(f"[cpm:build] lockfile updated: {lock_path}")
         return 0
 
 
