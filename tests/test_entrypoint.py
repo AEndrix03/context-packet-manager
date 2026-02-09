@@ -34,6 +34,16 @@ def test_dispatch_rejects_removed_legacy_alias(
     assert "embed:status" in capsys.readouterr().out
 
 
+def test_dispatch_supports_builtin_embed_command(
+    tmp_path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli_main = importlib.import_module("cpm_cli.main")
+    code = cli_main.main(["embed", "list"], start_dir=tmp_path)
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "[cpm:embed]" in out
+
+
 def test_query_command_dispatches_to_native_retriever(
     monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
