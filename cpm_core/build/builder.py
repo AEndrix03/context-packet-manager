@@ -19,6 +19,7 @@ from cpm_core.packet.faiss_db import FaissFlatIP
 from cpm_core.packet.io import (
     compute_checksums,
     load_manifest,
+    read_docs_jsonl,
     write_docs_jsonl,
     write_manifest,
     write_vectors_f16,
@@ -490,6 +491,126 @@ def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest
 
     print("[done] build ok")
     return manifest
+
+
+def embed_packet_from_chunks(
+    packet_dir: Path,
+    *,
+    model_name: str,
+    max_seq_length: int,
+    archive: bool,
+    archive_format: str,
+    embedder: Embedder,
+    builder_name: str = "cpm:build-embed",
+    packet_name_override: str | None = None,
+    packet_version_override: str | None = None,
+    description_override: str | None = None,
+) -> PacketManifest | None:
+    root = packet_dir.resolve()
+    docs_path = root / "docs.jsonl"
+    if not docs_path.exists():
+        print(f"[error] docs.jsonl not found: {docs_path}")
+        return None
+    try:
+        chunks = read_docs_jsonl(docs_path)
+    except Exception as exc:
+        print(f"[error] unable to read docs.jsonl: {exc}")
+        return None
+    if not chunks:
+        print("[error] docs.jsonl contains no chunks")
+        return None
+
+    existing_manifest = None
+    manifest_path = root / "manifest.json"
+    if manifest_path.exists():
+        try:
+            existing_manifest = load_manifest(manifest_path)
+        except Exception:
+            existing_manifest = None
+
+    packet_name = packet_name_override or (existing_manifest.cpm.get("name") if existing_manifest else None) or root.parent.name
+    packet_version = packet_version_override or (existing_manifest.cpm.get("version") if existing_manifest else None) or root.name
+    if not packet_name or not packet_version:
+        print("[error] packet name/version are required")
+        return None
+
+    if description_override is not None and description_override.strip():
+        description = description_override.strip()
+    elif existing_manifest and str(existing_manifest.cpm.get("description") or "").strip():
+        description = str(existing_manifest.cpm.get("description")).strip()
+    elif existing_manifest and str(existing_manifest.source.get("input_dir") or "").strip():
+        description = str(existing_manifest.source.get("input_dir")).strip()
+    else:
+        description = root.as_posix()
+
+    source_input = (
+        str(existing_manifest.source.get("input_dir") or "").strip()
+        if existing_manifest is not None and isinstance(existing_manifest.source, dict)
+        else ""
+    )
+    source_path = Path(source_input).expanduser() if source_input else root
+    if not source_path.is_absolute():
+        source_path = (root / source_path).resolve()
+    if not source_path.exists():
+        source_path = root
+
+    ext_counts: Dict[str, int] = {}
+    if existing_manifest is not None and isinstance(existing_manifest.source, dict):
+        raw_ext = existing_manifest.source.get("file_ext_counts")
+        if isinstance(raw_ext, dict):
+            for key, value in raw_ext.items():
+                try:
+                    parsed = int(value)
+                except Exception:
+                    continue
+                if parsed > 0:
+                    ext_counts[str(key)] = parsed
+    if not ext_counts:
+        for chunk in chunks:
+            ext = str(chunk.metadata.get("ext") or "").strip().lower()
+            if not ext:
+                continue
+            ext_counts[ext] = ext_counts.get(ext, 0) + 1
+
+    extra_files: list[str] = []
+    extra_manifest = dict(existing_manifest.extras) if existing_manifest is not None else {}
+    if existing_manifest is not None and isinstance(existing_manifest.files, dict):
+        for value in existing_manifest.files.values():
+            rel = None
+            if isinstance(value, str):
+                rel = value
+            elif isinstance(value, dict) and isinstance(value.get("path"), str):
+                rel = value.get("path")
+            if rel is None:
+                continue
+            rel_norm = str(rel).replace("\\", "/").strip()
+            if rel_norm in {"", "docs.jsonl", "vectors.f16.bin", "faiss/index.faiss"}:
+                continue
+            if (root / rel_norm).exists() and rel_norm not in extra_files:
+                extra_files.append(rel_norm)
+
+    print(f"[embed] packet_dir={root}")
+    print(f"[embed] chunks_total={len(chunks)}")
+    return materialize_packet(
+        PacketMaterializationInput(
+            source_path=source_path,
+            out_root=root,
+            packet_name=str(packet_name),
+            packet_version=str(packet_version),
+            description=description,
+            chunks=chunks,
+            ext_counts=ext_counts,
+            model_name=model_name,
+            max_seq_length=max_seq_length,
+            archive=archive,
+            archive_format=archive_format,
+            builder_name=builder_name,
+            embedder=embedder,
+            incremental_enabled=False,
+            extra_files=tuple(extra_files),
+            extra_manifest=extra_manifest if extra_manifest else None,
+        )
+    )
 
 
 @cpmbuilder(name="default-builder", group="cpm")
