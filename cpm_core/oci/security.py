@@ -54,7 +54,7 @@ def redact_token(value: str) -> str:
 def redact_command_for_log(command: list[str]) -> list[str]:
     redacted: list[str] = []
     skip_next = False
-    for idx, item in enumerate(command):
+    for item in command:
         lower = item.lower()
         if skip_next:
             redacted.append("***")
