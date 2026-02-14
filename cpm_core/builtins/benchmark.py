@@ -8,6 +8,7 @@ import statistics
 import time
 from argparse import ArgumentParser
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,10 @@ class BenchmarkCommand(_WorkspaceAwareCommand):
         parser.add_argument("--reranker", default=DEFAULT_RERANKER, help="Reranker strategy")
         parser.add_argument("--queries-file", help="JSON file with query list for IR evaluation")
         parser.add_argument("--qrels-file", help="JSON file with relevance judgements")
+        parser.add_argument("--out", help="Write benchmark report JSON to this path")
+        parser.add_argument("--max-latency-ms", type=float, help="Fail if avg latency exceeds threshold")
+        parser.add_argument("--min-citation-coverage", type=float, help="Fail if citation coverage is below threshold")
+        parser.add_argument("--min-ndcg", type=float, help="Fail if IR nDCG@k is below threshold")
         parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
 
     def run(self, argv: Any) -> int:
@@ -114,10 +119,21 @@ class BenchmarkCommand(_WorkspaceAwareCommand):
                 ),
                 entry=entry,
             )
+        report["kpi_gates"] = _evaluate_gates(
+            report=report,
+            max_latency_ms=getattr(argv, "max_latency_ms", None),
+            min_citation_coverage=getattr(argv, "min_citation_coverage", None),
+            min_ndcg=getattr(argv, "min_ndcg", None),
+        )
+        _write_benchmark_report(
+            workspace_root=workspace_root,
+            report=report,
+            explicit_out=str(getattr(argv, "out", "") or "").strip() or None,
+        )
 
         if str(getattr(argv, "format", "text")) == "json":
             print(json.dumps(report, indent=2, ensure_ascii=False))
-            return 0
+            return 0 if bool(report["kpi_gates"]["ok"]) else 1
 
         print(f"[cpm:benchmark] runs={report['runs']} success_rate={report['success_rate']}")
         print(
@@ -138,6 +154,10 @@ class BenchmarkCommand(_WorkspaceAwareCommand):
                 f"[cpm:benchmark] ir mrr={ir_metrics.get('mrr')} "
                 f"ndcg@k={ir_metrics.get('ndcg_at_k')} recall@k={ir_metrics.get('recall_at_k')}"
             )
+        gates = report.get("kpi_gates")
+        if isinstance(gates, dict) and not bool(gates.get("ok", True)):
+            print(f"[cpm:benchmark] gate_failed={','.join(gates.get('failures', []))}")
+            return 1
         return 0
 
 
@@ -241,3 +261,38 @@ def _evaluate_ir_metrics(*, config: IrBenchmarkConfig, entry: CPMRegistryEntry) 
         "ndcg_at_k": round(statistics.mean(ndcgs), 6),
         "recall_at_k": round(statistics.mean(recalls), 6),
     }
+
+
+def _evaluate_gates(
+    *,
+    report: dict[str, Any],
+    max_latency_ms: float | None,
+    min_citation_coverage: float | None,
+    min_ndcg: float | None,
+) -> dict[str, Any]:
+    failures: list[str] = []
+    latency_avg = float(report.get("latency_ms_avg") or 0.0)
+    citation = float(report.get("citation_coverage_avg") or 0.0)
+    if max_latency_ms is not None and latency_avg > float(max_latency_ms):
+        failures.append("latency")
+    if min_citation_coverage is not None and citation < float(min_citation_coverage):
+        failures.append("citation_coverage")
+    ir = report.get("ir_metrics") if isinstance(report.get("ir_metrics"), dict) else None
+    if min_ndcg is not None:
+        ndcg = float(ir.get("ndcg_at_k") or 0.0) if isinstance(ir, dict) else 0.0
+        if ndcg < float(min_ndcg):
+            failures.append("ndcg")
+    return {"ok": len(failures) == 0, "failures": failures}
+
+
+def _write_benchmark_report(*, workspace_root: Path, report: dict[str, Any], explicit_out: str | None) -> Path:
+    if explicit_out:
+        path = Path(explicit_out)
+    else:
+        root = workspace_root / "state" / "benchmarks"
+        root.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+        path = root / f"benchmark-{stamp}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return path

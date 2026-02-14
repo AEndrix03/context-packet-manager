@@ -281,6 +281,9 @@ cpm benchmark --packet my-docs --query "auth" --runs 5 --indexer hybrid-rrf --fo
 
 # IR benchmark with labelled relevance (MRR, nDCG@k, recall@k)
 cpm benchmark --packet my-docs --query "auth" --queries-file ./bench/queries.json --qrels-file ./bench/qrels.json --format json
+
+# CI gate example (non-zero exit on KPI regressions)
+cpm benchmark --packet my-docs --query "auth" --runs 5 --max-latency-ms 200 --min-citation-coverage 1.0 --min-ndcg 0.70
 ```
 
 ### Use with Claude Desktop

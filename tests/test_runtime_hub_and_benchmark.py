@@ -108,6 +108,9 @@ def test_benchmark_command_outputs_json(
     assert code == 0
     assert '"runs": 2' in out
     assert '"citation_coverage_avg"' in out
+    bench_root = workspace_root / "state" / "benchmarks"
+    assert bench_root.exists()
+    assert any(path.suffix == ".json" for path in bench_root.iterdir())
 
 
 def test_benchmark_command_reports_ir_metrics(
@@ -193,3 +196,63 @@ def test_benchmark_command_reports_ir_metrics(
     assert code == 0
     assert '"ir_metrics"' in out
     assert '"mrr"' in out
+
+
+def test_benchmark_command_fails_on_gate_threshold(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / ".cpm"
+    monkeypatch.setenv("RAG_CPM_DIR", str(workspace_root))
+
+    class _LowCoverageRetriever:
+        def retrieve(self, identifier: str, **kwargs):
+            del identifier, kwargs
+            return {
+                "ok": True,
+                "packet": "demo",
+                "query": "auth",
+                "k": 5,
+                "results": [{"id": "a", "score": 0.9, "text": "alpha", "metadata": {"path": "docs/a.md"}}],
+                "compiled_context": {
+                    "token_estimate": 120,
+                    "core_snippets": [{"citation": ""}],
+                },
+            }
+
+    entry = CPMRegistryEntry(
+        group="cpm",
+        name="native-retriever",
+        target=_LowCoverageRetriever,
+        kind="retriever",
+        origin="builtin",
+    )
+    monkeypatch.setattr(benchmark_mod.QueryCommand, "_load_retriever_entries", lambda self, root: [entry])
+    monkeypatch.setattr(benchmark_mod.QueryCommand, "_resolve_retriever_entry", lambda self, entries, requested: entry)
+
+    out_file = tmp_path / "bench.json"
+    code = cli_main(
+        [
+            "benchmark",
+            "--workspace-dir",
+            str(tmp_path),
+            "--packet",
+            "demo",
+            "--query",
+            "auth",
+            "--runs",
+            "1",
+            "--min-citation-coverage",
+            "1.0",
+            "--out",
+            str(out_file),
+            "--format",
+            "json",
+        ],
+        start_dir=tmp_path,
+    )
+    assert code == 1
+    assert out_file.exists()
+    payload = json.loads(out_file.read_text(encoding="utf-8"))
+    assert payload["kpi_gates"]["ok"] is False
+    assert "citation_coverage" in payload["kpi_gates"]["failures"]
