@@ -284,6 +284,9 @@ cpm benchmark --packet my-docs --query "auth" --queries-file ./bench/queries.jso
 
 # CI gate example (non-zero exit on KPI regressions)
 cpm benchmark --packet my-docs --query "auth" --runs 5 --max-latency-ms 200 --min-citation-coverage 1.0 --min-ndcg 0.70
+
+# Compare against baseline report and fail on regressions
+cpm benchmark --packet my-docs --query "auth" --baseline ./bench/baseline.json --max-latency-regression-pct 15 --min-ndcg-delta -0.02 --min-mrr-delta -0.02
 ```
 
 ### Use with Claude Desktop

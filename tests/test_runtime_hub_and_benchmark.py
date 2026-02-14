@@ -256,3 +256,79 @@ def test_benchmark_command_fails_on_gate_threshold(
     payload = json.loads(out_file.read_text(encoding="utf-8"))
     assert payload["kpi_gates"]["ok"] is False
     assert "citation_coverage" in payload["kpi_gates"]["failures"]
+
+
+def test_benchmark_command_compares_with_baseline_and_fails_on_regression(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace_root = tmp_path / ".cpm"
+    monkeypatch.setenv("RAG_CPM_DIR", str(workspace_root))
+
+    class _Retriever:
+        def retrieve(self, identifier: str, **kwargs):
+            del identifier, kwargs
+            return {
+                "ok": True,
+                "packet": "demo",
+                "query": "auth",
+                "k": 5,
+                "results": [{"id": "doc-a", "score": 0.9, "text": "alpha", "metadata": {"path": "docs/a.md"}}],
+                "compiled_context": {
+                    "token_estimate": 100,
+                    "core_snippets": [{"citation": "docs/a.md"}],
+                },
+            }
+
+    entry = CPMRegistryEntry(
+        group="cpm",
+        name="native-retriever",
+        target=_Retriever,
+        kind="retriever",
+        origin="builtin",
+    )
+    monkeypatch.setattr(benchmark_mod.QueryCommand, "_load_retriever_entries", lambda self, root: [entry])
+    monkeypatch.setattr(benchmark_mod.QueryCommand, "_resolve_retriever_entry", lambda self, entries, requested: entry)
+
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text(
+        json.dumps(
+            {
+                "latency_ms_avg": 0.0001,
+                "ir_metrics": {"mrr": 1.0, "ndcg_at_k": 1.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    out_path = tmp_path / "bench-regression.json"
+    code = cli_main(
+        [
+            "benchmark",
+            "--workspace-dir",
+            str(tmp_path),
+            "--packet",
+            "demo",
+            "--query",
+            "auth",
+            "--runs",
+            "1",
+            "--baseline",
+            str(baseline_path),
+            "--max-latency-regression-pct",
+            "10.0",
+            "--min-ndcg-delta",
+            "0.0",
+            "--min-mrr-delta",
+            "0.0",
+            "--out",
+            str(out_path),
+            "--format",
+            "json",
+        ],
+        start_dir=tmp_path,
+    )
+    assert code == 1
+    payload = json.loads(out_path.read_text(encoding="utf-8"))
+    assert payload["comparison"]["ok"] is True
+    assert "latency_regression" in payload["kpi_gates"]["failures"]

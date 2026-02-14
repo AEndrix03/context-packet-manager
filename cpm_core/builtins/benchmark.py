@@ -39,10 +39,26 @@ class BenchmarkCommand(_WorkspaceAwareCommand):
         parser.add_argument("--reranker", default=DEFAULT_RERANKER, help="Reranker strategy")
         parser.add_argument("--queries-file", help="JSON file with query list for IR evaluation")
         parser.add_argument("--qrels-file", help="JSON file with relevance judgements")
+        parser.add_argument("--baseline", help="Baseline benchmark JSON report for regression comparison")
         parser.add_argument("--out", help="Write benchmark report JSON to this path")
         parser.add_argument("--max-latency-ms", type=float, help="Fail if avg latency exceeds threshold")
         parser.add_argument("--min-citation-coverage", type=float, help="Fail if citation coverage is below threshold")
         parser.add_argument("--min-ndcg", type=float, help="Fail if IR nDCG@k is below threshold")
+        parser.add_argument(
+            "--max-latency-regression-pct",
+            type=float,
+            help="Fail if avg latency regression vs baseline exceeds this percentage",
+        )
+        parser.add_argument(
+            "--min-ndcg-delta",
+            type=float,
+            help="Fail if nDCG@k delta vs baseline is below this value",
+        )
+        parser.add_argument(
+            "--min-mrr-delta",
+            type=float,
+            help="Fail if MRR delta vs baseline is below this value",
+        )
         parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format")
 
     def run(self, argv: Any) -> int:
@@ -119,11 +135,19 @@ class BenchmarkCommand(_WorkspaceAwareCommand):
                 ),
                 entry=entry,
             )
+        baseline_path = str(getattr(argv, "baseline", "") or "").strip()
+        if baseline_path:
+            report["comparison"] = _compare_with_baseline(report=report, baseline_path=Path(baseline_path))
         report["kpi_gates"] = _evaluate_gates(
             report=report,
-            max_latency_ms=getattr(argv, "max_latency_ms", None),
-            min_citation_coverage=getattr(argv, "min_citation_coverage", None),
-            min_ndcg=getattr(argv, "min_ndcg", None),
+            config=GateConfig(
+                max_latency_ms=getattr(argv, "max_latency_ms", None),
+                min_citation_coverage=getattr(argv, "min_citation_coverage", None),
+                min_ndcg=getattr(argv, "min_ndcg", None),
+                max_latency_regression_pct=getattr(argv, "max_latency_regression_pct", None),
+                min_ndcg_delta=getattr(argv, "min_ndcg_delta", None),
+                min_mrr_delta=getattr(argv, "min_mrr_delta", None),
+            ),
         )
         _write_benchmark_report(
             workspace_root=workspace_root,
@@ -154,6 +178,12 @@ class BenchmarkCommand(_WorkspaceAwareCommand):
                 f"[cpm:benchmark] ir mrr={ir_metrics.get('mrr')} "
                 f"ndcg@k={ir_metrics.get('ndcg_at_k')} recall@k={ir_metrics.get('recall_at_k')}"
             )
+        comparison = report.get("comparison")
+        if isinstance(comparison, dict) and comparison.get("ok", False):
+            print(
+                f"[cpm:benchmark] delta latency_pct={comparison.get('latency_regression_pct')} "
+                f"ndcg_delta={comparison.get('ndcg_delta')} mrr_delta={comparison.get('mrr_delta')}"
+            )
         gates = report.get("kpi_gates")
         if isinstance(gates, dict) and not bool(gates.get("ok", True)):
             print(f"[cpm:benchmark] gate_failed={','.join(gates.get('failures', []))}")
@@ -170,6 +200,16 @@ class IrBenchmarkConfig:
     k: int
     queries_path: Path
     qrels_path: Path
+
+
+@dataclass(frozen=True)
+class GateConfig:
+    max_latency_ms: float | None = None
+    min_citation_coverage: float | None = None
+    min_ndcg: float | None = None
+    max_latency_regression_pct: float | None = None
+    min_ndcg_delta: float | None = None
+    min_mrr_delta: float | None = None
 
 
 def _p95(values: list[float]) -> float:
@@ -266,22 +306,34 @@ def _evaluate_ir_metrics(*, config: IrBenchmarkConfig, entry: CPMRegistryEntry) 
 def _evaluate_gates(
     *,
     report: dict[str, Any],
-    max_latency_ms: float | None,
-    min_citation_coverage: float | None,
-    min_ndcg: float | None,
+    config: GateConfig,
 ) -> dict[str, Any]:
     failures: list[str] = []
     latency_avg = float(report.get("latency_ms_avg") or 0.0)
     citation = float(report.get("citation_coverage_avg") or 0.0)
-    if max_latency_ms is not None and latency_avg > float(max_latency_ms):
+    if config.max_latency_ms is not None and latency_avg > float(config.max_latency_ms):
         failures.append("latency")
-    if min_citation_coverage is not None and citation < float(min_citation_coverage):
+    if config.min_citation_coverage is not None and citation < float(config.min_citation_coverage):
         failures.append("citation_coverage")
     ir = report.get("ir_metrics") if isinstance(report.get("ir_metrics"), dict) else None
-    if min_ndcg is not None:
+    if config.min_ndcg is not None:
         ndcg = float(ir.get("ndcg_at_k") or 0.0) if isinstance(ir, dict) else 0.0
-        if ndcg < float(min_ndcg):
+        if ndcg < float(config.min_ndcg):
             failures.append("ndcg")
+    comparison = report.get("comparison") if isinstance(report.get("comparison"), dict) else None
+    if isinstance(comparison, dict) and comparison.get("ok", False):
+        latency_regression_pct = float(comparison.get("latency_regression_pct") or 0.0)
+        ndcg_delta = float(comparison.get("ndcg_delta") or 0.0)
+        mrr_delta = float(comparison.get("mrr_delta") or 0.0)
+        if (
+            config.max_latency_regression_pct is not None
+            and latency_regression_pct > float(config.max_latency_regression_pct)
+        ):
+            failures.append("latency_regression")
+        if config.min_ndcg_delta is not None and ndcg_delta < float(config.min_ndcg_delta):
+            failures.append("ndcg_delta")
+        if config.min_mrr_delta is not None and mrr_delta < float(config.min_mrr_delta):
+            failures.append("mrr_delta")
     return {"ok": len(failures) == 0, "failures": failures}
 
 
@@ -296,3 +348,30 @@ def _write_benchmark_report(*, workspace_root: Path, report: dict[str, Any], exp
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def _compare_with_baseline(*, report: dict[str, Any], baseline_path: Path) -> dict[str, Any]:
+    if not baseline_path.exists():
+        return {"ok": False, "error": "baseline_not_found"}
+    try:
+        baseline = json.loads(baseline_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"ok": False, "error": "baseline_invalid"}
+    if not isinstance(baseline, dict):
+        return {"ok": False, "error": "baseline_invalid"}
+    current_latency = float(report.get("latency_ms_avg") or 0.0)
+    baseline_latency = float(baseline.get("latency_ms_avg") or 0.0)
+    latency_regression_pct = 0.0
+    if baseline_latency > 0:
+        latency_regression_pct = ((current_latency - baseline_latency) / baseline_latency) * 100.0
+    current_ir = report.get("ir_metrics") if isinstance(report.get("ir_metrics"), dict) else {}
+    baseline_ir = baseline.get("ir_metrics") if isinstance(baseline.get("ir_metrics"), dict) else {}
+    ndcg_delta = float(current_ir.get("ndcg_at_k") or 0.0) - float(baseline_ir.get("ndcg_at_k") or 0.0)
+    mrr_delta = float(current_ir.get("mrr") or 0.0) - float(baseline_ir.get("mrr") or 0.0)
+    return {
+        "ok": True,
+        "baseline_path": str(baseline_path),
+        "latency_regression_pct": round(latency_regression_pct, 6),
+        "ndcg_delta": round(ndcg_delta, 6),
+        "mrr_delta": round(mrr_delta, 6),
+    }
