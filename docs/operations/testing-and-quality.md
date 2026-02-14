@@ -25,3 +25,4 @@ python -m mypy cpm_core cpm_cli cpm_builtin cpm_plugins
 - `cpm replay <log>` deve verificare hash output deterministico.
 - `cpm diff left right --max-drift <x>` deve restituire exit code non-zero se supera soglia.
 - `cpm benchmark --runs N` misura KPI runtime (latenza, token medi, citation coverage).
+- `cpm benchmark --queries-file queries.json --qrels-file qrels.json` misura KPI IR (`MRR`, `nDCG@k`, `recall@k`).

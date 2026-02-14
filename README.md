@@ -278,6 +278,9 @@ cpm diff my-docs@1.0.0 my-docs@1.1.0 --max-drift 0.05
 
 # Runtime KPI benchmark sampling
 cpm benchmark --packet my-docs --query "auth" --runs 5 --indexer hybrid-rrf --format json
+
+# IR benchmark with labelled relevance (MRR, nDCG@k, recall@k)
+cpm benchmark --packet my-docs --query "auth" --queries-file ./bench/queries.json --qrels-file ./bench/qrels.json --format json
 ```
 
 ### Use with Claude Desktop

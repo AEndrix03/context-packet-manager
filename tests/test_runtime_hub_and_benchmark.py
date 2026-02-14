@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -107,3 +108,88 @@ def test_benchmark_command_outputs_json(
     assert code == 0
     assert '"runs": 2' in out
     assert '"citation_coverage_avg"' in out
+
+
+def test_benchmark_command_reports_ir_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    workspace_root = tmp_path / ".cpm"
+    monkeypatch.setenv("RAG_CPM_DIR", str(workspace_root))
+
+    class _IrRetriever:
+        def retrieve(self, identifier: str, **kwargs):
+            del kwargs
+            if "auth" in identifier:
+                hits = [
+                    {"id": "doc-auth", "score": 0.9, "text": "auth", "metadata": {"path": "docs/auth.md"}},
+                    {"id": "doc-x", "score": 0.2, "text": "x", "metadata": {"path": "docs/x.md"}},
+                ]
+            else:
+                hits = [
+                    {"id": "doc-db", "score": 0.8, "text": "db", "metadata": {"path": "docs/db.md"}},
+                    {"id": "doc-z", "score": 0.1, "text": "z", "metadata": {"path": "docs/z.md"}},
+                ]
+            return {
+                "ok": True,
+                "packet": "demo",
+                "query": identifier,
+                "k": 2,
+                "results": hits,
+                "compiled_context": {
+                    "token_estimate": 100,
+                    "core_snippets": [{"citation": "docs/auth.md"}],
+                },
+            }
+
+    entry = CPMRegistryEntry(
+        group="cpm",
+        name="native-retriever",
+        target=_IrRetriever,
+        kind="retriever",
+        origin="builtin",
+    )
+    monkeypatch.setattr(benchmark_mod.QueryCommand, "_load_retriever_entries", lambda self, root: [entry])
+    monkeypatch.setattr(benchmark_mod.QueryCommand, "_resolve_retriever_entry", lambda self, entries, requested: entry)
+
+    queries_path = tmp_path / "queries.json"
+    qrels_path = tmp_path / "qrels.json"
+    queries_path.write_text(
+        json.dumps([{"id": "q1", "text": "auth setup"}, {"id": "q2", "text": "db config"}]),
+        encoding="utf-8",
+    )
+    qrels_path.write_text(
+        json.dumps(
+            {
+                "q1": {"doc-auth": 1.0, "doc-x": 0.0},
+                "q2": {"doc-db": 1.0, "doc-z": 0.0},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code = cli_main(
+        [
+            "benchmark",
+            "--workspace-dir",
+            str(tmp_path),
+            "--packet",
+            "demo",
+            "--query",
+            "auth",
+            "--runs",
+            "1",
+            "--queries-file",
+            str(queries_path),
+            "--qrels-file",
+            str(qrels_path),
+            "--format",
+            "json",
+        ],
+        start_dir=tmp_path,
+    )
+    out = capsys.readouterr().out
+    assert code == 0
+    assert '"ir_metrics"' in out
+    assert '"mrr"' in out
