@@ -287,6 +287,9 @@ cpm benchmark --packet my-docs --query "auth" --runs 5 --max-latency-ms 200 --mi
 
 # Compare against baseline report and fail on regressions
 cpm benchmark --packet my-docs --query "auth" --baseline ./bench/baseline.json --max-latency-regression-pct 15 --min-ndcg-delta -0.02 --min-mrr-delta -0.02
+
+# KPI trend over historical benchmark reports
+cpm benchmark-trend --format json
 ```
 
 ### Use with Claude Desktop
