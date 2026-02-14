@@ -19,3 +19,8 @@ python -m mypy cpm_core cpm_cli cpm_builtin cpm_plugins
 ## Regole
 - ogni fix deve includere test di regressione quando applicabile,
 - preferire test mirati durante sviluppo, suite completa prima di merge.
+
+## Supply-chain runtime checks
+- `cpm query --as-of ...` deve avere test snapshot lock storico.
+- `cpm replay <log>` deve verificare hash output deterministico.
+- `cpm diff left right --max-drift <x>` deve restituire exit code non-zero se supera soglia.

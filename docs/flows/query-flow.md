@@ -1,7 +1,7 @@
 # Query Flow
 
 ## Entry point
-`QueryCommand.run()` risolve workspace, lock install, retriever richiesto/suggerito e trasporto embedding.
+`QueryCommand.run()` risolve workspace, policy runtime (`policy.yml`), lock install (anche storico con `--as-of`), retriever richiesto/suggerito e trasporto embedding.
 
 ## Pipeline
 1. risoluzione retriever (`default` o plugin),
@@ -9,11 +9,14 @@
 3. opzionale: risoluzione `--source` (`dir://`, `oci://`, `https://`) con fetch lazy in cache CAS locale (`.cpm/cache/objects/<digest>`),
 4. per source OCI: verifica trust (signature/SBOM/provenance) prima della materializzazione in strict mode,
 5. invocazione retriever con indexer/reranker selezionati,
-6. output testuale o JSON.
+6. context compiler strutturato (`outline/core_snippets/glossary/risks/citations`) con token cap,
+7. policy enforcement su trust e token budget,
+8. output testuale o JSON + replay log deterministico (`state/replay/query-*.json`).
 
 ## Retriever nativi
 - `NativeFaissRetriever`
 - indexer `FaissFlatIPIndexer`
+- indexer `hybrid-rrf` (dense + BM25 + RRF)
 - reranker `NoopReranker` / `TokenDiversityReranker`
 
 ## Osservazioni

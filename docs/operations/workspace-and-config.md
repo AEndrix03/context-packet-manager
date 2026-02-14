@@ -23,3 +23,21 @@
 cpm init
 cpm doctor
 ```
+
+## Policy runtime
+`policy.yml` (in root workspace `.cpm/`) abilita enforcement unificato su query/install/source:
+
+```yaml
+policy:
+  mode: strict
+  allowed_sources:
+    - oci://registry.local/*
+  min_trust_score: 0.8
+  max_tokens: 6000
+```
+
+`mode: warn` permette esecuzione con warning per strict failures.
+
+## Replay e audit
+- Query salva replay log deterministico in `.cpm/state/replay/query-<timestamp>.json`.
+- `cpm replay <log>` ricalcola output hash e verifica riproducibilita.

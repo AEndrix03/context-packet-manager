@@ -263,6 +263,18 @@ cpm query \
 
 # Or specify a custom retriever
 cpm query --packet my-docs --query "auth" --retriever custom-retriever
+
+# Hybrid retrieval (dense + BM25 + RRF) with structured context compiler
+cpm query --packet my-docs --query "auth" --indexer hybrid-rrf --max-context-tokens 4000
+
+# Time-travel query using install lock snapshots
+cpm query --packet my-docs --query "auth" --as-of 2025-06-01
+
+# Deterministic replay verification
+cpm replay ./.cpm/state/replay/query-20260101T120000Z.json
+
+# Semantic diff + drift threshold for CI
+cpm diff my-docs@1.0.0 my-docs@1.1.0 --max-drift 0.05
 ```
 
 ### Use with Claude Desktop

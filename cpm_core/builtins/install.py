@@ -19,6 +19,7 @@ from cpm_core.api import cpmcommand
 from cpm_core.oci import OciClient, OciClientConfig, write_install_lock
 from cpm_core.oci.packaging import package_ref_for
 from cpm_core.oci.security import evaluate_trust_report
+from cpm_core.policy import evaluate_policy, load_policy
 
 from .commands import _WorkspaceAwareCommand
 
@@ -38,6 +39,7 @@ class InstallCommand(_WorkspaceAwareCommand):
 
     def run(self, argv: Any) -> int:
         workspace_root = self._resolve(getattr(argv, "workspace_dir", None))
+        policy = load_policy(workspace_root)
         name, version = parse_package_spec(str(argv.spec))
         if not version:
             print("[cpm:install] version is required (use name@version)")
@@ -66,6 +68,10 @@ class InstallCommand(_WorkspaceAwareCommand):
         )
 
         ref = package_ref_for(name=name, version=version, repository=repository)
+        policy_decision = evaluate_policy(policy, source_uri=f"oci://{ref}")
+        if not policy_decision.allow:
+            print(f"[cpm:install] policy deny source=oci://{ref} reason={policy_decision.reason}")
+            return 1
         digest = client.resolve(ref)
         verification = evaluate_trust_report(
             client.discover_referrers(f"{ref.split('@', 1)[0]}@{digest}"),
@@ -79,6 +85,15 @@ class InstallCommand(_WorkspaceAwareCommand):
                 "[cpm:install] verification failed "
                 f"(strict): {','.join(verification.strict_failures)}"
             )
+            return 1
+        trust_decision = evaluate_policy(
+            policy,
+            source_uri=f"oci://{ref}",
+            trust_score=verification.trust_score,
+            strict_failures=list(verification.strict_failures),
+        )
+        if not trust_decision.allow:
+            print(f"[cpm:install] policy deny source=oci://{ref} reason={trust_decision.reason}")
             return 1
         no_embed = bool(getattr(argv, "no_embed", False))
 

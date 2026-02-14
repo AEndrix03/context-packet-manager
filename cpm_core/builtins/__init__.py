@@ -14,12 +14,14 @@ from .commands import (
     PluginDoctorCommand,
     PluginListCommand,
 )
-from .pkg import PkgCommand
-from .query import QueryCommand, register_builtin_retrievers
-from .lookup import LookupCommand
+from .diff import DiffCommand
 from .embed import EmbedCommand
 from .install import InstallCommand
+from .lookup import LookupCommand
+from .pkg import PkgCommand
 from .publish import PublishCommand
+from .query import QueryCommand, register_builtin_retrievers
+from .replay import ReplayCommand
 
 __all__ = [
     "register_builtin_commands",
@@ -37,6 +39,8 @@ _BUILTIN_FEATURES: Sequence[type] = (
     EmbedCommand,
     InstallCommand,
     PublishCommand,
+    ReplayCommand,
+    DiffCommand,
     LookupCommand,
     HelpCommand,
     ListingCommand,

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import os
 from argparse import ArgumentParser
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 
@@ -12,7 +15,8 @@ from cpm_builtin.embeddings import EmbeddingClient, EmbeddingsConfigService
 from cpm_builtin.packages import PackageManager, parse_package_spec
 from cpm_builtin.packages.layout import version_dir
 from cpm_core.api import CPMAbstractRetriever, cpmcommand, cpmretriever
-from cpm_core.oci import read_install_lock, write_install_lock
+from cpm_core.oci import read_install_lock, read_install_lock_as_of, write_install_lock
+from cpm_core.policy import evaluate_policy, load_policy
 from cpm_core.registry import CPMRegistryEntry, FeatureRegistry
 from cpm_core.sources import SourceResolver
 
@@ -23,6 +27,7 @@ _CONFIG_RETRIEVER_KEYS = ("retriever", "query_retriever", "default_retriever")
 DEFAULT_EMBED_URL = "http://127.0.0.1:8876"
 DEFAULT_EMBED_MODE = "http"
 DEFAULT_INDEXER = "faiss-flatip"
+HYBRID_INDEXER = "hybrid-rrf"
 DEFAULT_RERANKER = "none"
 
 
@@ -76,7 +81,10 @@ class TokenDiversityReranker:
         return chosen
 
 
-_INDEXERS: dict[str, RetrievalIndexer] = {DEFAULT_INDEXER: FaissFlatIPIndexer()}
+_INDEXERS: dict[str, RetrievalIndexer] = {
+    DEFAULT_INDEXER: FaissFlatIPIndexer(),
+    HYBRID_INDEXER: FaissFlatIPIndexer(),
+}
 _RERANKERS: dict[str, RetrievalReranker] = {
     DEFAULT_RERANKER: NoopReranker(),
     "token-diversity": TokenDiversityReranker(),
@@ -190,6 +198,7 @@ class NativeFaissRetriever(CPMAbstractRetriever):
                 "hint": "configure an embedding provider with `cpm embed add ... --set-default` or set RAG_EMBED_URL/RAG_EMBED_MODE",
             }
 
+        warnings: list[str] = []
         try:
             vector = embedder.embed_texts(
                 [query],
@@ -199,7 +208,10 @@ class NativeFaissRetriever(CPMAbstractRetriever):
                 dtype="float32",
                 show_progress=False,
             )
-            scores, ids = indexer.search(index=index, vector=vector, k=max(int(k), 1))
+            dense_k = max(int(k), 1)
+            if indexer_name == HYBRID_INDEXER:
+                dense_k = max(int(k) * 4, 20)
+            scores, ids = indexer.search(index=index, vector=vector, k=dense_k)
         except FileNotFoundError:
             return {
                 "ok": False,
@@ -215,24 +227,38 @@ class NativeFaissRetriever(CPMAbstractRetriever):
                 "packet": packet,
             }
 
-        hits: list[dict[str, Any]] = []
-        for idx, score in zip(ids[0], scores[0]):
+        dense_hits: list[dict[str, Any]] = []
+        for rank, (idx, score) in enumerate(zip(ids[0], scores[0]), start=1):
             if int(idx) < 0:
                 continue
             if int(idx) >= len(docs):
                 continue
             doc = docs[int(idx)]
-            hits.append(
+            dense_hits.append(
                 {
                     "score": float(score),
                     "id": doc.get("id"),
                     "text": doc.get("text"),
                     "metadata": doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {},
+                    "_dense_rank": rank,
+                    "_doc_idx": int(idx),
                 }
             )
 
+        hits = dense_hits
+        if indexer_name == HYBRID_INDEXER:
+            sparse_index_path = packet_dir / "sparse" / "bm25.json"
+            sparse_hits, sparse_warning = _bm25_hits(
+                query=query,
+                docs=docs,
+                k=max(int(k) * 4, 20),
+                sparse_index_path=sparse_index_path,
+            )
+            if sparse_warning:
+                warnings.append(sparse_warning)
+            hits = _fuse_rrf(dense_hits, sparse_hits, k=int(k))
+
         reranked_hits = reranker.rerank(query=query, hits=hits, k=int(k))
-        warnings: list[str] = []
         score_values = [float(item.get("score")) for item in reranked_hits if isinstance(item.get("score"), (int, float))]
         if len(score_values) >= 2:
             score_range = max(score_values) - min(score_values)
@@ -240,6 +266,28 @@ class NativeFaissRetriever(CPMAbstractRetriever):
                 warnings.append(
                     "all top-k similarity scores are nearly identical; embeddings may be degenerate or constant"
                 )
+
+        max_tokens = int(kwargs.get("max_context_tokens", 6000))
+        compiled_context = _compile_context(
+            query=query,
+            hits=reranked_hits,
+            max_tokens=max_tokens,
+            warnings=warnings,
+        )
+        output_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "packet": str(packet_dir),
+                    "query": query,
+                    "indexer": indexer_name,
+                    "reranker": reranker_name,
+                    "results": reranked_hits,
+                    "compiled_context": compiled_context,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
 
         return {
             "ok": True,
@@ -257,6 +305,8 @@ class NativeFaissRetriever(CPMAbstractRetriever):
             "indexer": indexer_name,
             "reranker": reranker_name,
             "results": reranked_hits,
+            "compiled_context": compiled_context,
+            "output_hash": output_hash,
             "warnings": warnings,
         }
 
@@ -305,10 +355,13 @@ class QueryCommand(_WorkspaceAwareCommand):
         parser.add_argument("--packet", help="Packet name or path")
         parser.add_argument("--source", help="Source URI (dir://, oci://, https://...)")
         parser.add_argument("--query", required=True, help="Query text")
+        parser.add_argument("--as-of", help="Historical snapshot timestamp (ISO or YYYY-MM-DD)")
         parser.add_argument("-k", type=int, default=5, help="Number of results to retrieve")
         parser.add_argument("--retriever", help="Retriever name or group:name")
         parser.add_argument("--indexer", default=DEFAULT_INDEXER, help="Indexer strategy")
         parser.add_argument("--reranker", default=DEFAULT_RERANKER, help="Reranker strategy")
+        parser.add_argument("--max-context-tokens", type=int, default=6000, help="Context compiler token cap")
+        parser.add_argument("--replay-log", help="Write deterministic replay log to this path")
         parser.add_argument("--embed-url", help="Embedding server URL override")
         parser.add_argument(
             "--embeddings-mode",
@@ -326,6 +379,7 @@ class QueryCommand(_WorkspaceAwareCommand):
         requested_dir = getattr(argv, "workspace_dir", None)
         workspace_root = self._resolve(requested_dir)
         self.workspace_root = workspace_root
+        policy = load_policy(workspace_root)
 
         source_uri = str(getattr(argv, "source", "") or "").strip()
         packet_name = str(getattr(argv, "packet", "")).strip()
@@ -335,6 +389,10 @@ class QueryCommand(_WorkspaceAwareCommand):
 
         resolved_reference: dict[str, Any] | None = None
         if source_uri:
+            source_policy = evaluate_policy(policy, source_uri=source_uri)
+            if not source_policy.allow:
+                print(f"[cpm:query] policy deny source={source_uri} reason={source_policy.reason}")
+                return 1
             try:
                 reference, local_packet = SourceResolver(workspace_root).resolve_and_fetch(source_uri)
             except Exception as exc:
@@ -352,8 +410,32 @@ class QueryCommand(_WorkspaceAwareCommand):
                 "refs": reference.metadata.get("refs"),
                 "trust": reference.metadata.get("trust"),
             }
+            trust_failures = []
+            verification = reference.metadata.get("verification")
+            if isinstance(verification, dict):
+                candidate_failures = verification.get("strict_failures")
+                if isinstance(candidate_failures, list):
+                    trust_failures = [str(item) for item in candidate_failures]
+            trust_eval = evaluate_policy(
+                policy,
+                source_uri=source_uri,
+                trust_score=float(reference.metadata.get("trust_score") or 0.0),
+                strict_failures=trust_failures,
+            )
+            if not trust_eval.allow:
+                print(f"[cpm:query] policy deny source={source_uri} reason={trust_eval.reason}")
+                return 1
+            if trust_eval.decision == "warn":
+                for warning in trust_eval.warnings:
+                    print(f"[cpm:query] warning={warning}")
 
-        install_lock = None if source_uri else self._ensure_install_lock(workspace_root, packet_name)
+        as_of_value = str(getattr(argv, "as_of", "") or "").strip()
+        install_lock = None if source_uri else self._ensure_install_lock(workspace_root, packet_name, as_of=as_of_value)
+        if as_of_value and install_lock:
+            lock_name = str(install_lock.get("name") or packet_name).strip()
+            lock_version = str(install_lock.get("version") or "").strip()
+            if lock_name and lock_version:
+                packet_name = f"{lock_name}@{lock_version}"
         requested = self._requested_retriever(argv, workspace_root, install_lock=install_lock)
         entries = self._load_retriever_entries(workspace_root)
 
@@ -396,9 +478,36 @@ class QueryCommand(_WorkspaceAwareCommand):
             indexer=str(getattr(argv, "indexer", DEFAULT_INDEXER)),
             reranker=str(getattr(argv, "reranker", DEFAULT_RERANKER)),
             selected_model=str(install_lock.get("selected_model")) if install_lock else None,
+            max_context_tokens=int(getattr(argv, "max_context_tokens", policy.max_tokens)),
         )
         if resolved_reference:
             payload["source"] = resolved_reference
+
+        compiled = payload.get("compiled_context")
+        if isinstance(compiled, dict):
+            token_count = int(compiled.get("token_estimate") or 0)
+            context_policy = evaluate_policy(policy, token_count=token_count)
+            if not context_policy.allow:
+                payload = {
+                    "ok": False,
+                    "error": "policy_denied",
+                    "detail": context_policy.reason,
+                    "packet": payload.get("packet"),
+                    "query": payload.get("query"),
+                    "k": payload.get("k"),
+                }
+
+        self._write_replay_log(
+            workspace_root=workspace_root,
+            payload=payload,
+            packet=packet_name,
+            query=str(argv.query),
+            indexer=str(getattr(argv, "indexer", DEFAULT_INDEXER)),
+            reranker=str(getattr(argv, "reranker", DEFAULT_RERANKER)),
+            selected_model=str(install_lock.get("selected_model")) if install_lock else None,
+            source=resolved_reference,
+            explicit_log_path=str(getattr(argv, "replay_log", "") or "").strip() or None,
+        )
 
         if getattr(argv, "format", "text") == "json":
             print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -481,6 +590,7 @@ class QueryCommand(_WorkspaceAwareCommand):
         indexer: str,
         reranker: str,
         selected_model: str | None,
+        max_context_tokens: int,
     ) -> dict[str, Any]:
         retriever = entry.target()
         call_attempts = (
@@ -494,6 +604,7 @@ class QueryCommand(_WorkspaceAwareCommand):
                 indexer=indexer,
                 reranker=reranker,
                 selected_model=selected_model,
+                max_context_tokens=max_context_tokens,
             ),
             lambda: retriever.retrieve(query, k=k, packet=packet),
             lambda: retriever.retrieve(query, k=k),
@@ -546,9 +657,22 @@ class QueryCommand(_WorkspaceAwareCommand):
             resolved_mode = str(default_provider.type).strip().lower() or DEFAULT_EMBED_MODE
         return resolved_url, resolved_mode
 
-    def _ensure_install_lock(self, workspace_root: Path, packet_name: str) -> dict[str, Any] | None:
+    def _ensure_install_lock(
+        self,
+        workspace_root: Path,
+        packet_name: str,
+        *,
+        as_of: str | None = None,
+    ) -> dict[str, Any] | None:
         if not packet_name:
             return None
+        if as_of:
+            parsed_as_of = _parse_as_of(as_of)
+            if parsed_as_of is None:
+                return None
+            historical = read_install_lock_as_of(workspace_root, packet_name, as_of=parsed_as_of)
+            if historical:
+                return historical
         existing = read_install_lock(workspace_root, packet_name)
         if existing:
             return existing
@@ -628,6 +752,14 @@ class QueryCommand(_WorkspaceAwareCommand):
         if isinstance(warnings, list):
             for warning in warnings:
                 print(f"[cpm:query] warning={str(warning)}")
+        compiled_context = payload.get("compiled_context")
+        if isinstance(compiled_context, dict):
+            print(
+                f"[cpm:query] context tokens={compiled_context.get('token_estimate')} "
+                f"snippets={len(compiled_context.get('core_snippets', []))}"
+            )
+        if payload.get("output_hash"):
+            print(f"[cpm:query] output_hash={payload.get('output_hash')}")
         for index, item in enumerate(payload.get("results", []), start=1):
             score = item.get("score")
             score_text = f"{float(score):.8f}" if isinstance(score, (int, float)) else "-"
@@ -635,6 +767,43 @@ class QueryCommand(_WorkspaceAwareCommand):
             path = metadata.get("path", "-")
             text = str(item.get("text", "")).replace("\n", " ").strip()
             print(f"[{index}] score={score_text} id={item.get('id', '-')} path={path} text={text}")
+
+    def _write_replay_log(
+        self,
+        *,
+        workspace_root: Path,
+        payload: dict[str, Any],
+        packet: str,
+        query: str,
+        indexer: str,
+        reranker: str,
+        selected_model: str | None,
+        source: dict[str, Any] | None,
+        explicit_log_path: str | None,
+    ) -> None:
+        output_hash = str(payload.get("output_hash") or "").strip()
+        if not output_hash:
+            return
+        record = {
+            "schema": "cpm.replay.v1",
+            "timestamp": datetime.now(tz=UTC).isoformat(),
+            "packet": packet,
+            "query": query,
+            "indexer": indexer,
+            "reranker": reranker,
+            "selected_model": selected_model,
+            "source": source or {},
+            "output_hash": output_hash,
+        }
+        if explicit_log_path:
+            path = Path(explicit_log_path)
+        else:
+            root = workspace_root / "state" / "replay"
+            root.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
+            path = root / f"query-{stamp}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def _normalize_payload(raw: Any, *, packet: str, query: str, k: int) -> dict[str, Any]:
@@ -691,6 +860,239 @@ def _normalize_hit(item: Any) -> dict[str, Any]:
             "metadata": item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
         }
     return {"score": None, "id": None, "text": str(item), "metadata": {}}
+
+
+def _parse_as_of(value: str) -> datetime | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    candidates = [raw]
+    if len(raw) == 10:
+        candidates.append(f"{raw}T23:59:59+00:00")
+    for candidate in candidates:
+        try:
+            parsed = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
+    return None
+
+
+def _bm25_hits(
+    *,
+    query: str,
+    docs: list[dict[str, Any]],
+    k: int,
+    sparse_index_path: Path,
+) -> tuple[list[dict[str, Any]], str | None]:
+    terms = [token for token in query.lower().split() if token]
+    if not terms:
+        return [], None
+    if not sparse_index_path.exists():
+        # Build on-the-fly when sparse artifact is not present to preserve fallback.
+        return _build_bm25_from_docs(terms=terms, docs=docs, k=k), "sparse_index_missing_fallback_runtime"
+    try:
+        payload = json.loads(sparse_index_path.read_text(encoding="utf-8"))
+    except Exception:
+        return _build_bm25_from_docs(terms=terms, docs=docs, k=k), "sparse_index_invalid_fallback_runtime"
+    idf = payload.get("idf") if isinstance(payload.get("idf"), dict) else {}
+    doc_len = payload.get("doc_len") if isinstance(payload.get("doc_len"), list) else []
+    tf = payload.get("tf") if isinstance(payload.get("tf"), list) else []
+    avgdl = float(payload.get("avgdl", 1.0) or 1.0)
+    if not tf or not doc_len:
+        return _build_bm25_from_docs(terms=terms, docs=docs, k=k), "sparse_index_empty_fallback_runtime"
+    scores: list[tuple[int, float]] = []
+    k1 = 1.2
+    b = 0.75
+    for idx, (doc_tf, length) in enumerate(zip(tf, doc_len)):
+        if not isinstance(doc_tf, dict):
+            continue
+        score = 0.0
+        for term in terms:
+            term_tf = float(doc_tf.get(term, 0.0))
+            if term_tf <= 0:
+                continue
+            denom = term_tf + k1 * (1.0 - b + b * (float(length) / avgdl))
+            score += float(idf.get(term, 0.0)) * ((term_tf * (k1 + 1.0)) / max(denom, 1e-6))
+        if score > 0:
+            scores.append((idx, score))
+    scores.sort(key=lambda item: item[1], reverse=True)
+    hits = []
+    for rank, (idx, score) in enumerate(scores[: max(k, 1)], start=1):
+        if idx >= len(docs):
+            continue
+        doc = docs[idx]
+        hits.append(
+            {
+                "score": float(score),
+                "id": doc.get("id"),
+                "text": doc.get("text"),
+                "metadata": doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {},
+                "_sparse_rank": rank,
+                "_doc_idx": idx,
+            }
+        )
+    return hits, None
+
+
+def _build_bm25_from_docs(*, terms: list[str], docs: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
+    tokenized = [str(doc.get("text") or "").lower().split() for doc in docs]
+    doc_count = max(len(tokenized), 1)
+    avgdl = sum(len(tokens) for tokens in tokenized) / doc_count
+    df: dict[str, int] = {}
+    for tokens in tokenized:
+        unique = set(tokens)
+        for token in unique:
+            df[token] = df.get(token, 0) + 1
+    idf = {
+        term: math.log(1 + (doc_count - df.get(term, 0) + 0.5) / (df.get(term, 0) + 0.5))
+        for term in terms
+    }
+    k1 = 1.2
+    b = 0.75
+    scores: list[tuple[int, float]] = []
+    for idx, tokens in enumerate(tokenized):
+        counts: dict[str, int] = {}
+        for token in tokens:
+            if token in idf:
+                counts[token] = counts.get(token, 0) + 1
+        score = 0.0
+        for term in terms:
+            tf = float(counts.get(term, 0))
+            if tf <= 0:
+                continue
+            denom = tf + k1 * (1.0 - b + b * (len(tokens) / max(avgdl, 1e-6)))
+            score += idf.get(term, 0.0) * ((tf * (k1 + 1.0)) / max(denom, 1e-6))
+        if score > 0:
+            scores.append((idx, score))
+    scores.sort(key=lambda item: item[1], reverse=True)
+    hits = []
+    for rank, (idx, score) in enumerate(scores[: max(k, 1)], start=1):
+        doc = docs[idx]
+        hits.append(
+            {
+                "score": float(score),
+                "id": doc.get("id"),
+                "text": doc.get("text"),
+                "metadata": doc.get("metadata") if isinstance(doc.get("metadata"), dict) else {},
+                "_sparse_rank": rank,
+                "_doc_idx": idx,
+            }
+        )
+    return hits
+
+
+def _fuse_rrf(
+    dense_hits: list[dict[str, Any]],
+    sparse_hits: list[dict[str, Any]],
+    *,
+    k: int,
+) -> list[dict[str, Any]]:
+    by_doc: dict[int, dict[str, Any]] = {}
+    for index, hit in enumerate(dense_hits, start=1):
+        doc_idx = int(hit.get("_doc_idx", -1))
+        if doc_idx < 0:
+            continue
+        score = 1.0 / (60.0 + float(hit.get("_dense_rank") or index))
+        current = by_doc.setdefault(doc_idx, dict(hit))
+        current["_rrf_score"] = float(current.get("_rrf_score", 0.0)) + score
+    for index, hit in enumerate(sparse_hits, start=1):
+        doc_idx = int(hit.get("_doc_idx", -1))
+        if doc_idx < 0:
+            continue
+        score = 1.0 / (60.0 + float(hit.get("_sparse_rank") or index))
+        current = by_doc.setdefault(doc_idx, dict(hit))
+        current["_rrf_score"] = float(current.get("_rrf_score", 0.0)) + score
+        if "text" not in current:
+            current["text"] = hit.get("text")
+        if "metadata" not in current:
+            current["metadata"] = hit.get("metadata")
+        if "id" not in current:
+            current["id"] = hit.get("id")
+    ranked = sorted(by_doc.values(), key=lambda item: float(item.get("_rrf_score", 0.0)), reverse=True)
+    output: list[dict[str, Any]] = []
+    for item in ranked[: max(k, 1)]:
+        output.append(
+            {
+                "score": float(item.get("_rrf_score", 0.0)),
+                "id": item.get("id"),
+                "text": item.get("text"),
+                "metadata": item.get("metadata") if isinstance(item.get("metadata"), dict) else {},
+            }
+        )
+    return output
+
+
+def _compile_context(
+    *,
+    query: str,
+    hits: list[dict[str, Any]],
+    max_tokens: int,
+    warnings: list[str],
+) -> dict[str, Any]:
+    budget = max(int(max_tokens), 1)
+    used = 0
+    core_snippets: list[dict[str, Any]] = []
+    glossary: list[str] = []
+    seen_terms: set[str] = set()
+    for hit in hits:
+        text = str(hit.get("text") or "").strip()
+        if not text:
+            continue
+        citation = _citation_for_hit(hit)
+        snippet_tokens = _estimate_tokens(text)
+        if used + snippet_tokens > budget:
+            continue
+        core_snippets.append(
+            {
+                "id": hit.get("id"),
+                "text": text,
+                "score": hit.get("score"),
+                "citation": citation,
+            }
+        )
+        used += snippet_tokens
+        for token in text.split():
+            cleaned = token.strip(".,:;!?()[]{}\"'").lower()
+            if len(cleaned) < 6 or cleaned in seen_terms:
+                continue
+            seen_terms.add(cleaned)
+            glossary.append(cleaned)
+            if len(glossary) >= 12:
+                break
+        if used >= budget:
+            break
+    outline = [f"Answer query: {query}", "Ground on retrieved snippets", "Include citations for each snippet"]
+    citations = [item["citation"] for item in core_snippets]
+    risks = list(warnings)
+    if not core_snippets:
+        risks.append("no_snippets_within_budget")
+    return {
+        "outline": outline,
+        "core_snippets": core_snippets,
+        "glossary": glossary,
+        "risks": risks,
+        "citations": citations,
+        "token_estimate": used,
+    }
+
+
+def _citation_for_hit(hit: dict[str, Any]) -> str:
+    metadata = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
+    path = str(metadata.get("path") or "").strip()
+    if path:
+        return path
+    identifier = str(hit.get("id") or "").strip()
+    if identifier:
+        return f"id:{identifier}"
+    return "unknown"
+
+
+def _estimate_tokens(text: str) -> int:
+    words = len([token for token in text.split() if token])
+    return max(1, int(words * 1.3))
 
 
 def register_builtin_retrievers(registry: FeatureRegistry) -> None:
