@@ -45,8 +45,8 @@ class LookupCommand(_WorkspaceAwareCommand):
         parser.add_argument("--workspace-dir", default=".", help="Workspace root directory")
         parser.add_argument(
             "--destination",
-            default="dist",
-            help="Packet output root (default: ./dist relative to workspace)",
+            default="packages",
+            help="Installed packets root (default: ./packages under workspace, i.e. ./.cpm/packages from project root)",
         )
         parser.add_argument(
             "--all-versions",
@@ -58,7 +58,12 @@ class LookupCommand(_WorkspaceAwareCommand):
     def run(self, argv: Any) -> int:
         workspace_root = self._resolve(getattr(argv, "workspace_dir", None))
         self.workspace_root = workspace_root
-        destination = Path(str(getattr(argv, "destination", "dist") or "dist"))
+        destination_raw = str(getattr(argv, "destination", "packages") or "packages")
+        destination = Path(destination_raw)
+        if not destination.is_absolute() and workspace_root.name == ".cpm":
+            parts = destination.parts
+            if len(parts) > 0 and parts[0] == ".cpm":
+                destination = Path(*parts[1:]) if len(parts) > 1 else Path(".")
         root = destination if destination.is_absolute() else (workspace_root / destination)
 
         packets = self._collect_packets(root=root, include_all_versions=bool(getattr(argv, "all_versions", False)))
@@ -67,10 +72,10 @@ class LookupCommand(_WorkspaceAwareCommand):
             return 0
 
         if not packets:
-            print(f"[cpm:lookup] no packets found under {root}")
+            print(f"[cpm:lookup] no installed packets found under {root}")
             return 0
 
-        print(f"[cpm:lookup] root={root} packets={len(packets)}")
+        print(f"[cpm:lookup] root={root} installed_packets={len(packets)}")
         for item in packets:
             status = "ok" if item["is_valid"] else "incomplete"
             print(
@@ -117,6 +122,9 @@ class LookupCommand(_WorkspaceAwareCommand):
 
         name = yml.get("name") or cpm_meta.get("name") or packet_dir.parent.name
         version = yml.get("version") or cpm_meta.get("version") or packet_dir.name
+        if str(name).strip() == str(version).strip() and packet_dir.parent.name.strip() != str(name).strip():
+            # Some older packets persisted the version into `name`; use directory layout as a safer display fallback.
+            name = packet_dir.parent.name
         description = yml.get("description") or cpm_meta.get("description") or ""
         docs_count = counts.get("docs")
         vectors_count = counts.get("vectors")

@@ -33,6 +33,17 @@ def _error_body_snippet(response: requests.Response, max_chars: int = 200) -> st
     return compact[:max_chars]
 
 
+def _retry_after_seconds(response: requests.Response) -> float | None:
+    value = (response.headers or {}).get("retry-after")
+    if value is None:
+        return None
+    try:
+        seconds = float(value.strip())
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, seconds)
+
+
 def _coerce_optional_bool(value: Any) -> bool | None:
     if value is None:
         return None
@@ -179,11 +190,15 @@ class OpenAIEmbeddingsHttpClient:
         last_error: Exception | None = None
 
         for attempt in range(1, self.max_retries + 1):
+            retry_delay_seconds: float | None = None
+            started_at = time.perf_counter()
             try:
-                logger.debug(
-                    "openai embeddings request attempt=%s endpoint=%s count=%s",
+                logger.info(
+                    "openai embeddings request start attempt=%s/%s endpoint=%s model=%s count=%s",
                     attempt,
+                    self.max_retries,
                     self.endpoint,
+                    request.model,
                     len(request.texts),
                 )
                 response = requests.post(
@@ -193,8 +208,32 @@ class OpenAIEmbeddingsHttpClient:
                     timeout=self.timeout,
                 )
                 status = response.status_code
+                elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+                logger.info(
+                    "openai embeddings request done attempt=%s/%s status=%s elapsed_ms=%.1f",
+                    attempt,
+                    self.max_retries,
+                    status,
+                    elapsed_ms,
+                )
+                if status == 429:
+                    snippet = _error_body_snippet(response)
+                    retry_after = _retry_after_seconds(response)
+                    retry_delay_seconds = (
+                        retry_after
+                        if retry_after is not None
+                        else max(1.0, min(self.backoff_seconds * attempt, 10.0))
+                    )
+                    raise RuntimeError(
+                        f"rate limited (status={status}) payload_snippet='{snippet}'"
+                    )
                 if 400 <= status < 500:
                     snippet = _error_body_snippet(response)
+                    logger.error(
+                        "openai embeddings bad request status=%s payload_snippet='%s'",
+                        status,
+                        snippet,
+                    )
                     raise ValueError(
                         f"bad request (status={status}) payload_snippet='{snippet}'"
                     )
@@ -230,7 +269,7 @@ class OpenAIEmbeddingsHttpClient:
             except RuntimeError as exc:
                 last_error = exc
                 logger.warning(
-                    "openai embeddings upstream error attempt=%s/%s: %s",
+                    "openai embeddings upstream/rate-limit error attempt=%s/%s: %s",
                     attempt,
                     self.max_retries,
                     exc,
@@ -239,7 +278,18 @@ class OpenAIEmbeddingsHttpClient:
                 raise
 
             if attempt < self.max_retries:
-                time.sleep(min(self.backoff_seconds * attempt, 1.0))
+                delay_seconds = (
+                    retry_delay_seconds
+                    if retry_delay_seconds is not None
+                    else min(self.backoff_seconds * attempt, 1.0)
+                )
+                logger.info(
+                    "openai embeddings retry sleep attempt=%s/%s delay_seconds=%.2f",
+                    attempt,
+                    self.max_retries,
+                    delay_seconds,
+                )
+                time.sleep(delay_seconds)
 
         raise RuntimeError("failed to obtain embeddings after retries") from last_error
 

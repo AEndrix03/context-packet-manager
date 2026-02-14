@@ -185,6 +185,12 @@ class CPMLLMBuilder(CPMAbstractBuilder):
             ),
         )
 
+        destination_path = Path(str(getattr(args, "destination", "")))
+        packet_version = str(getattr(args, "packet_version", None) or "0.0.0")
+        fallback_packet_name = destination_path.name
+        if destination_path.parent.name and destination_path.name == packet_version:
+            fallback_packet_name = destination_path.parent.name
+
         runtime = LLMBuilderRuntimeConfig(
             llm_endpoint=str(getattr(args, "llm_endpoint", None) or base.llm_endpoint),
             request_timeout=float(getattr(args, "request_timeout", None) or base.request_timeout),
@@ -195,8 +201,8 @@ class CPMLLMBuilder(CPMAbstractBuilder):
             constraints=constraints,
             model_name=str(getattr(args, "model_name", None) or DEFAULT_MODEL),
             max_seq_length=int(getattr(args, "max_seq_length", None) or 1024),
-            packet_name=str(getattr(args, "name", None) or Path(str(getattr(args, "destination"))).name),
-            version=str(getattr(args, "packet_version", None) or "0.0.0"),
+            packet_name=str(getattr(args, "name", None) or fallback_packet_name),
+            version=packet_version,
             description=str(getattr(args, "description", None) or "").strip() or None,
             archive=bool(getattr(args, "archive", True)),
             archive_format=str(getattr(args, "archive_format", None) or "tar.gz"),

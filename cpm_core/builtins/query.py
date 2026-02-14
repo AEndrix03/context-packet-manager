@@ -231,9 +231,19 @@ class NativeFaissRetriever(CPMAbstractRetriever):
             )
 
         reranked_hits = reranker.rerank(query=query, hits=hits, k=int(k))
+        warnings: list[str] = []
+        score_values = [float(item.get("score")) for item in reranked_hits if isinstance(item.get("score"), (int, float))]
+        if len(score_values) >= 2:
+            score_range = max(score_values) - min(score_values)
+            if score_range <= 1e-6:
+                warnings.append(
+                    "all top-k similarity scores are nearly identical; embeddings may be degenerate or constant"
+                )
+
         return {
             "ok": True,
-            "packet": packet_dir.name,
+            "packet": packet_dir.parent.name,
+            "packet_version": packet_dir.name,
             "packet_path": str(packet_dir).replace("\\", "/"),
             "query": query,
             "k": int(k),
@@ -246,6 +256,7 @@ class NativeFaissRetriever(CPMAbstractRetriever):
             "indexer": indexer_name,
             "reranker": reranker_name,
             "results": reranked_hits,
+            "warnings": warnings,
         }
 
     @staticmethod
@@ -318,10 +329,25 @@ class QueryCommand(_WorkspaceAwareCommand):
         install_lock = self._ensure_install_lock(workspace_root, packet_name)
         requested = self._requested_retriever(argv, workspace_root, install_lock=install_lock)
         entries = self._load_retriever_entries(workspace_root)
-        entry = self._resolve_retriever_entry(entries, requested)
-        if entry is None and install_lock and install_lock.get("suggested_retriever"):
-            suggested = str(install_lock.get("suggested_retriever")).strip()
-            print(f"[cpm:query] downgrade: suggested retriever '{suggested}' unavailable, using default")
+
+        explicit_retriever = bool(getattr(argv, "retriever", None))
+        suggested_retriever = None
+        if not explicit_retriever and install_lock and install_lock.get("suggested_retriever"):
+            suggested_retriever = str(install_lock.get("suggested_retriever")).strip() or None
+
+        entry = self._resolve_retriever_entry(
+            entries,
+            requested,
+            quiet=bool(suggested_retriever and requested == suggested_retriever and not explicit_retriever),
+        )
+        if entry is None and not explicit_retriever and suggested_retriever and requested == suggested_retriever:
+            print(
+                f"[cpm:query] suggested retriever '{suggested_retriever}' is not installed; "
+                f"install the plugin providing it, then retry. Falling back to '{DEFAULT_RETRIEVER}'."
+            )
+            entry = self._resolve_retriever_entry(entries, DEFAULT_RETRIEVER)
+        elif entry is None and not explicit_retriever and requested != DEFAULT_RETRIEVER:
+            print(f"[cpm:query] retriever '{requested}' unavailable; fallback to default '{DEFAULT_RETRIEVER}'")
             entry = self._resolve_retriever_entry(entries, DEFAULT_RETRIEVER)
         if entry is None:
             return 1
@@ -378,7 +404,11 @@ class QueryCommand(_WorkspaceAwareCommand):
         return [entry for entry in app.feature_registry.entries() if entry.kind == "retriever"]
 
     def _resolve_retriever_entry(
-        self, entries: Iterable[CPMRegistryEntry], requested: str
+        self,
+        entries: Iterable[CPMRegistryEntry],
+        requested: str,
+        *,
+        quiet: bool = False,
     ) -> CPMRegistryEntry | None:
         pool = list(entries)
         if not pool:
@@ -389,20 +419,23 @@ class QueryCommand(_WorkspaceAwareCommand):
             for entry in pool:
                 if entry.qualified_name == requested:
                     return entry
-            print(f"[cpm:query] retriever '{requested}' is not registered")
+            if not quiet:
+                print(f"[cpm:query] retriever '{requested}' is not registered")
             return None
 
         matches = [entry for entry in pool if entry.name == requested]
         if not matches:
-            print(f"[cpm:query] retriever '{requested}' is not registered")
-            available = ", ".join(sorted(entry.qualified_name for entry in pool))
-            print(f"[cpm:query] available retrievers: {available}")
+            if not quiet:
+                print(f"[cpm:query] retriever '{requested}' is not registered")
+                available = ", ".join(sorted(entry.qualified_name for entry in pool))
+                print(f"[cpm:query] available retrievers: {available}")
             return None
         if len(matches) > 1:
-            names = ", ".join(sorted(entry.qualified_name for entry in matches))
-            print(
-                f"[cpm:query] retriever '{requested}' is ambiguous ({names}); use group:name"
-            )
+            if not quiet:
+                names = ", ".join(sorted(entry.qualified_name for entry in matches))
+                print(
+                    f"[cpm:query] retriever '{requested}' is ambiguous ({names}); use group:name"
+                )
             return None
         return matches[0]
 
@@ -554,14 +587,16 @@ class QueryCommand(_WorkspaceAwareCommand):
             f"[cpm:query] retriever={retriever_name} packet={payload.get('packet')} k={payload.get('k')} "
             f"indexer={payload.get('indexer', DEFAULT_INDEXER)} reranker={payload.get('reranker', DEFAULT_RERANKER)}"
         )
+        warnings = payload.get("warnings")
+        if isinstance(warnings, list):
+            for warning in warnings:
+                print(f"[cpm:query] warning={str(warning)}")
         for index, item in enumerate(payload.get("results", []), start=1):
             score = item.get("score")
-            score_text = f"{float(score):.4f}" if isinstance(score, (int, float)) else "-"
+            score_text = f"{float(score):.8f}" if isinstance(score, (int, float)) else "-"
             metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
             path = metadata.get("path", "-")
             text = str(item.get("text", "")).replace("\n", " ").strip()
-            if len(text) > 160:
-                text = f"{text[:157]}..."
             print(f"[{index}] score={score_text} id={item.get('id', '-')} path={path} text={text}")
 
 
