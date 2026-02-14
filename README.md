@@ -623,6 +623,7 @@ CPM includes comprehensive documentation for every component:
 ### 🗺️ Navigation
 
 - **[DOCUMENTATION.md](./DOCUMENTATION.md)** - Complete documentation index
+- **[docs/README.md](./docs/README.md)** - Technical docs map (architecture, flows, components, operations)
 
 ---
 
