@@ -15,6 +15,7 @@ from cpm_builtin.embeddings import EmbeddingClient, EmbeddingsConfigService
 from cpm_builtin.packages import PackageManager, parse_package_spec
 from cpm_builtin.packages.layout import version_dir
 from cpm_core.api import CPMAbstractRetriever, cpmcommand, cpmretriever
+from cpm_core.hub import HubClient, load_hub_settings
 from cpm_core.oci import read_install_lock, read_install_lock_as_of, write_install_lock
 from cpm_core.policy import evaluate_policy, load_policy
 from cpm_core.registry import CPMRegistryEntry, FeatureRegistry
@@ -380,6 +381,7 @@ class QueryCommand(_WorkspaceAwareCommand):
         workspace_root = self._resolve(requested_dir)
         self.workspace_root = workspace_root
         policy = load_policy(workspace_root)
+        hub_client = HubClient(load_hub_settings(workspace_root))
 
         source_uri = str(getattr(argv, "source", "") or "").strip()
         packet_name = str(getattr(argv, "packet", "")).strip()
@@ -392,6 +394,14 @@ class QueryCommand(_WorkspaceAwareCommand):
             source_policy = evaluate_policy(policy, source_uri=source_uri)
             if not source_policy.allow:
                 print(f"[cpm:query] policy deny source={source_uri} reason={source_policy.reason}")
+                return 1
+            remote_source_policy = hub_client.evaluate_policy(
+                {"source_uri": source_uri, "trust_score": 1.0, "strict_failures": []},
+                _policy_payload(policy),
+            )
+            if isinstance(remote_source_policy, dict) and not bool(remote_source_policy.get("allow", True)):
+                reason = str(remote_source_policy.get("reason") or "unknown")
+                print(f"[cpm:query] hub policy deny source={source_uri} reason={reason}")
                 return 1
             try:
                 reference, local_packet = SourceResolver(workspace_root).resolve_and_fetch(source_uri)
@@ -424,6 +434,18 @@ class QueryCommand(_WorkspaceAwareCommand):
             )
             if not trust_eval.allow:
                 print(f"[cpm:query] policy deny source={source_uri} reason={trust_eval.reason}")
+                return 1
+            remote_trust_eval = hub_client.evaluate_policy(
+                {
+                    "source_uri": source_uri,
+                    "trust_score": float(reference.metadata.get("trust_score") or 0.0),
+                    "strict_failures": trust_failures,
+                },
+                _policy_payload(policy),
+            )
+            if isinstance(remote_trust_eval, dict) and not bool(remote_trust_eval.get("allow", True)):
+                reason = str(remote_trust_eval.get("reason") or "unknown")
+                print(f"[cpm:query] hub policy deny source={source_uri} reason={reason}")
                 return 1
             if trust_eval.decision == "warn":
                 for warning in trust_eval.warnings:
@@ -492,6 +514,19 @@ class QueryCommand(_WorkspaceAwareCommand):
                     "ok": False,
                     "error": "policy_denied",
                     "detail": context_policy.reason,
+                    "packet": payload.get("packet"),
+                    "query": payload.get("query"),
+                    "k": payload.get("k"),
+                }
+            remote_context_policy = hub_client.evaluate_policy(
+                {"source_uri": source_uri or None, "trust_score": 1.0, "strict_failures": [], "token_count": token_count},
+                _policy_payload(policy),
+            )
+            if isinstance(remote_context_policy, dict) and not bool(remote_context_policy.get("allow", True)):
+                payload = {
+                    "ok": False,
+                    "error": "hub_policy_denied",
+                    "detail": str(remote_context_policy.get("reason") or "unknown"),
                     "packet": payload.get("packet"),
                     "query": payload.get("query"),
                     "k": payload.get("k"),
@@ -1093,6 +1128,15 @@ def _citation_for_hit(hit: dict[str, Any]) -> str:
 def _estimate_tokens(text: str) -> int:
     words = len([token for token in text.split() if token])
     return max(1, int(words * 1.3))
+
+
+def _policy_payload(policy: Any) -> dict[str, Any]:
+    return {
+        "mode": str(getattr(policy, "mode", "strict")),
+        "allowed_sources": list(getattr(policy, "allowed_sources", ())),
+        "min_trust_score": float(getattr(policy, "min_trust_score", 0.0)),
+        "max_tokens": int(getattr(policy, "max_tokens", 6000)),
+    }
 
 
 def register_builtin_retrievers(registry: FeatureRegistry) -> None:

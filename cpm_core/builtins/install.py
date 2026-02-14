@@ -16,6 +16,7 @@ from typing import Any, Iterable
 from cpm_builtin.embeddings import EmbeddingsConfigService
 from cpm_builtin.packages import PackageManager, parse_package_spec
 from cpm_core.api import cpmcommand
+from cpm_core.hub import HubClient, load_hub_settings
 from cpm_core.oci import OciClient, OciClientConfig, write_install_lock
 from cpm_core.oci.packaging import package_ref_for
 from cpm_core.oci.security import evaluate_trust_report
@@ -40,6 +41,7 @@ class InstallCommand(_WorkspaceAwareCommand):
     def run(self, argv: Any) -> int:
         workspace_root = self._resolve(getattr(argv, "workspace_dir", None))
         policy = load_policy(workspace_root)
+        hub_client = HubClient(load_hub_settings(workspace_root))
         name, version = parse_package_spec(str(argv.spec))
         if not version:
             print("[cpm:install] version is required (use name@version)")
@@ -72,6 +74,14 @@ class InstallCommand(_WorkspaceAwareCommand):
         if not policy_decision.allow:
             print(f"[cpm:install] policy deny source=oci://{ref} reason={policy_decision.reason}")
             return 1
+        remote_source_decision = hub_client.evaluate_policy(
+            {"source_uri": f"oci://{ref}", "trust_score": 1.0, "strict_failures": []},
+            _policy_payload(policy),
+        )
+        if isinstance(remote_source_decision, dict) and not bool(remote_source_decision.get("allow", True)):
+            reason = str(remote_source_decision.get("reason") or "unknown")
+            print(f"[cpm:install] hub policy deny source=oci://{ref} reason={reason}")
+            return 1
         digest = client.resolve(ref)
         verification = evaluate_trust_report(
             client.discover_referrers(f"{ref.split('@', 1)[0]}@{digest}"),
@@ -94,6 +104,18 @@ class InstallCommand(_WorkspaceAwareCommand):
         )
         if not trust_decision.allow:
             print(f"[cpm:install] policy deny source=oci://{ref} reason={trust_decision.reason}")
+            return 1
+        remote_trust_decision = hub_client.evaluate_policy(
+            {
+                "source_uri": f"oci://{ref}",
+                "trust_score": verification.trust_score,
+                "strict_failures": list(verification.strict_failures),
+            },
+            _policy_payload(policy),
+        )
+        if isinstance(remote_trust_decision, dict) and not bool(remote_trust_decision.get("allow", True)):
+            reason = str(remote_trust_decision.get("reason") or "unknown")
+            print(f"[cpm:install] hub policy deny source=oci://{ref} reason={reason}")
             return 1
         no_embed = bool(getattr(argv, "no_embed", False))
 
@@ -325,3 +347,12 @@ def _string_or_none(value: Any) -> str | None:
         return None
     data = str(value).strip()
     return data if data else None
+
+
+def _policy_payload(policy: Any) -> dict[str, Any]:
+    return {
+        "mode": str(getattr(policy, "mode", "strict")),
+        "allowed_sources": list(getattr(policy, "allowed_sources", ())),
+        "min_trust_score": float(getattr(policy, "min_trust_score", 0.0)),
+        "max_tokens": int(getattr(policy, "max_tokens", 6000)),
+    }

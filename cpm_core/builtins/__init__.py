@@ -7,6 +7,7 @@ from typing import Sequence
 from cpm_core.registry import CPMRegistryEntry, FeatureRegistry
 
 from .build import BuildCommand, register_builtin_builders
+from .benchmark import BenchmarkCommand
 from .commands import (
     HelpCommand,
     InitCommand,
@@ -32,6 +33,7 @@ __all__ = [
 _BUILTIN_FEATURES: Sequence[type] = (
     InitCommand,
     BuildCommand,
+    BenchmarkCommand,
     QueryCommand,
     PluginListCommand,
     PluginDoctorCommand,

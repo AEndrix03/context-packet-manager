@@ -275,6 +275,9 @@ cpm replay ./.cpm/state/replay/query-20260101T120000Z.json
 
 # Semantic diff + drift threshold for CI
 cpm diff my-docs@1.0.0 my-docs@1.1.0 --max-drift 0.05
+
+# Runtime KPI benchmark sampling
+cpm benchmark --packet my-docs --query "auth" --runs 5 --indexer hybrid-rrf --format json
 ```
 
 ### Use with Claude Desktop
