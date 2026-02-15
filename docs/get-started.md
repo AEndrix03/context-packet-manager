@@ -44,6 +44,9 @@ cpm query --packet my-docs --query "authentication setup" -k 5
 ## 5) Next commands
 
 ```bash
+# Lazy query directly from registry
+cpm query --query "auth setup" --registry oci://registry.local/project/my-docs@1.0.0
+
 # Hybrid retrieval
 cpm query --packet my-docs --query "auth" --indexer hybrid-rrf
 
@@ -60,6 +63,7 @@ cpm benchmark --packet my-docs --query "auth" --runs 5
 ## Troubleshooting
 
 - If `query` fails with embedding errors: check provider URL/model in `.cpm/config/embeddings.yml`.
+- For lazy registry query, set `--embed <model>` to force model selection (default: `text-embedding-3-small`).
 - If packet is not found: run `cpm lookup` and verify packet/version.
 - If OCI policy fails: check `.cpm/policy.yml` and optional `[hub]` settings in `.cpm/config/config.toml`.
 

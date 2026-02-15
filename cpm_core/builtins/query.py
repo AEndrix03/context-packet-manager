@@ -30,6 +30,7 @@ DEFAULT_EMBED_MODE = "http"
 DEFAULT_INDEXER = "faiss-flatip"
 HYBRID_INDEXER = "hybrid-rrf"
 DEFAULT_RERANKER = "none"
+DEFAULT_LAZY_EMBED_MODEL = "text-embedding-3-small"
 
 
 class RetrievalIndexer(Protocol):
@@ -355,12 +356,20 @@ class QueryCommand(_WorkspaceAwareCommand):
         parser.add_argument("--workspace-dir", default=".", help="Workspace root directory")
         parser.add_argument("--packet", help="Packet name or path")
         parser.add_argument("--source", help="Source URI (dir://, oci://, https://...)")
+        parser.add_argument(
+            "--registry",
+            help="Lazy source shortcut: oci://..., https://..., dir://..., or OCI repository base (used with --packet)",
+        )
         parser.add_argument("--query", required=True, help="Query text")
         parser.add_argument("--as-of", help="Historical snapshot timestamp (ISO or YYYY-MM-DD)")
         parser.add_argument("-k", type=int, default=5, help="Number of results to retrieve")
         parser.add_argument("--retriever", help="Retriever name or group:name")
         parser.add_argument("--indexer", default=DEFAULT_INDEXER, help="Indexer strategy")
         parser.add_argument("--reranker", default=DEFAULT_RERANKER, help="Reranker strategy")
+        parser.add_argument(
+            "--embed",
+            help=f"Embedding model override for query-time embedding (default lazy model: {DEFAULT_LAZY_EMBED_MODEL})",
+        )
         parser.add_argument("--max-context-tokens", type=int, default=6000, help="Context compiler token cap")
         parser.add_argument("--replay-log", help="Write deterministic replay log to this path")
         parser.add_argument("--embed-url", help="Embedding server URL override")
@@ -384,9 +393,19 @@ class QueryCommand(_WorkspaceAwareCommand):
         hub_client = HubClient(load_hub_settings(workspace_root))
 
         source_uri = str(getattr(argv, "source", "") or "").strip()
+        registry_arg = str(getattr(argv, "registry", "") or "").strip()
         packet_name = str(getattr(argv, "packet", "")).strip()
+        try:
+            source_uri = self._resolve_source_uri(
+                source_uri=source_uri,
+                registry=registry_arg,
+                packet=packet_name,
+            )
+        except ValueError as exc:
+            print(f"[cpm:query] {exc}")
+            return 1
         if not packet_name and not source_uri:
-            print("[cpm:query] either --packet or --source is required")
+            print("[cpm:query] either --packet, --source, or --registry is required")
             return 1
 
         resolved_reference: dict[str, Any] | None = None
@@ -458,6 +477,10 @@ class QueryCommand(_WorkspaceAwareCommand):
             lock_version = str(install_lock.get("version") or "").strip()
             if lock_name and lock_version:
                 packet_name = f"{lock_name}@{lock_version}"
+        embed_override = str(getattr(argv, "embed", "") or "").strip() or None
+        if embed_override is None and source_uri:
+            embed_override = DEFAULT_LAZY_EMBED_MODEL
+
         requested = self._requested_retriever(argv, workspace_root, install_lock=install_lock)
         entries = self._load_retriever_entries(workspace_root)
 
@@ -499,7 +522,7 @@ class QueryCommand(_WorkspaceAwareCommand):
             embed_mode=resolved_embed_mode,
             indexer=str(getattr(argv, "indexer", DEFAULT_INDEXER)),
             reranker=str(getattr(argv, "reranker", DEFAULT_RERANKER)),
-            selected_model=str(install_lock.get("selected_model")) if install_lock else None,
+            selected_model=embed_override or (str(install_lock.get("selected_model")) if install_lock else None),
             max_context_tokens=int(getattr(argv, "max_context_tokens", policy.max_tokens)),
         )
         if resolved_reference:
@@ -802,6 +825,23 @@ class QueryCommand(_WorkspaceAwareCommand):
             path = metadata.get("path", "-")
             text = str(item.get("text", "")).replace("\n", " ").strip()
             print(f"[{index}] score={score_text} id={item.get('id', '-')} path={path} text={text}")
+
+    @staticmethod
+    def _resolve_source_uri(*, source_uri: str, registry: str, packet: str) -> str:
+        if source_uri:
+            return source_uri
+        if not registry:
+            return ""
+        value = registry.strip()
+        if value.startswith(("oci://", "https://", "http://", "dir://")):
+            if packet and value.startswith("oci://") and "@" not in value.split("/")[-1] and ":" not in value.split("/")[-1]:
+                return f"{value.rstrip('/')}/{packet}"
+            return value
+        if not packet:
+            raise ValueError(
+                "registry base without URI scheme requires --packet (example: --packet demo@1.0.0 --registry harbor.local/project)"
+            )
+        return f"oci://{value.rstrip('/')}/{packet}"
 
     def _write_replay_log(
         self,
