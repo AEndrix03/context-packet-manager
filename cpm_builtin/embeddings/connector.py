@@ -31,7 +31,18 @@ class HttpEmbeddingConnector:
         self.provider = provider
         self.max_retries = max(1, max_retries)
         self._headers, self._auth = self._build_session_auth()
-        self.endpoint = f"{provider.resolved_http_base_url}{provider.resolved_http_path}"
+        self.endpoint = self._resolve_endpoint(
+            provider.resolved_http_base_url,
+            provider.resolved_http_path,
+        )
+
+    @staticmethod
+    def _resolve_endpoint(base_url: str, path: str) -> str:
+        base = base_url.rstrip("/")
+        normalized_path = path if path.startswith("/") else f"/{path}"
+        if base.endswith(normalized_path):
+            return base
+        return f"{base}{normalized_path}"
 
     def _build_session_auth(self) -> tuple[dict[str, str], HTTPBasicAuth | None]:
         headers = self.provider.resolved_headers_static

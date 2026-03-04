@@ -154,6 +154,25 @@ def test_http_connector_batches_and_cache(tmp_path: Path) -> None:
         _shutdown(server)
 
 
+def test_http_connector_accepts_full_embeddings_endpoint_url(tmp_path: Path) -> None:
+    server, endpoint = _start_mock_server(response_dim=2)
+    try:
+        provider = EmbeddingProviderConfig(
+            name="full-endpoint",
+            type="http",
+            url=f"{endpoint}/v1/embeddings",
+            batch_size=1,
+            hint_dim=2,
+        )
+        connector = HttpEmbeddingConnector(provider)
+        matrix = connector.embed_texts(["a"])
+        assert matrix.shape == (1, 2)
+        assert connector.endpoint == f"{endpoint}/v1/embeddings"
+        assert server.last_path == "/v1/embeddings"
+    finally:
+        _shutdown(server)
+
+
 def test_http_connector_validates_dims(tmp_path: Path) -> None:
     server, endpoint = _start_mock_server(response_dim=2)
     try:

@@ -10,6 +10,7 @@
 `EmbeddingClient` risolve endpoint/modalita e invia richieste a backend HTTP.
 `OpenAIEmbeddingsHttpClient` gestisce serializzazione payload, parse risposta, hint headers e normalizzazione embeddings.
 Il controllo `EmbeddingClient.health()` considera il provider raggiungibile quando riceve qualsiasi risposta HTTP (anche `405/501` su `OPTIONS`), per evitare falsi negativi su adapter che non implementano `OPTIONS` ma servono correttamente `POST /v1/embeddings`.
+`HttpEmbeddingConnector` accetta provider `url` sia come base URL sia come endpoint completo `/v1/embeddings`, evitando duplicazioni del path.
 
 ## Regole pratiche
 - Preferire provider default esplicito.

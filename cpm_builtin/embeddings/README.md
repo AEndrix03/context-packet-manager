@@ -171,6 +171,8 @@ providers:
 
 For CPM standard-only mode, point providers to an adapter that exposes `POST /v1/embeddings`.
 The adapter is responsible for translating to TEI/Jina/custom backends.
+`url` can be configured either as adapter base URL (`http://host:port`) or full embeddings
+endpoint (`http://host:port/v1/embeddings`); CPM normalizes both forms.
 
 ```yaml
 # .cpm/config/embeddings.yml
