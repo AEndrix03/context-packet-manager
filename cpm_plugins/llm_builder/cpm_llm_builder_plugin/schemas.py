@@ -9,12 +9,17 @@ from typing import Any, Mapping, Sequence
 
 
 def estimate_tokens(text: str) -> int:
-    """Very rough token estimator used for local constraints."""
+    """Very rough token estimator used for local constraints.
 
+    Improved with better handling for CJK characters and non-ASCII text.
+    """
     cleaned = text.strip()
     if not cleaned:
         return 0
-    return max(1, len(cleaned) // 4)
+    ascii_chars = sum(1 for c in cleaned if ord(c) < 128)
+    non_ascii = len(cleaned) - ascii_chars
+    # CJK and similar: ~1 token per character
+    return max(1, (ascii_chars // 4) + non_ascii)
 
 
 def stable_hash(payload: str) -> str:
@@ -49,6 +54,41 @@ class SourceDocument:
     language: str
     mime: str
     source_hash: str
+
+
+@dataclass(frozen=True)
+class Window:
+    """Represents a window of lines from a file sent to the LLM for chunking."""
+    id: str
+    path: str
+    text: str
+    start_line: int
+    end_line: int
+    language: str
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "path": self.path,
+            "text": self.text,
+            "start_line": self.start_line,
+            "end_line": self.end_line,
+            "language": self.language,
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, Any]) -> "Window":
+        return cls(
+            id=str(payload.get("id", "")),
+            path=str(payload.get("path", "")),
+            text=str(payload.get("text", "")),
+            start_line=int(payload.get("start_line", 1)),
+            end_line=int(payload.get("end_line", 1)),
+            language=str(payload.get("language", "")),
+            metadata=dict(payload.get("metadata") or {}),
+        )
 
 
 @dataclass(frozen=True)
@@ -95,6 +135,8 @@ class Chunk:
     anchors: dict[str, Any] = field(default_factory=dict)
     relations: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    window_id: str = ""
+    chunk_tokens: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,35 +148,44 @@ class Chunk:
             "text": self.text,
             "relations": dict(self.relations),
             "metadata": dict(self.metadata),
+            "window_id": self.window_id,
+            "chunk_tokens": self.chunk_tokens,
         }
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "Chunk":
         tags_raw = payload.get("tags") or []
         tags = tuple(str(item) for item in tags_raw if isinstance(item, str))
+        text = str(payload.get("text") or "")
         return cls(
             id=str(payload.get("id") or ""),
-            text=str(payload.get("text") or ""),
+            text=text,
             title=str(payload.get("title") or ""),
             summary=str(payload.get("summary") or ""),
             tags=tags,
             anchors=_coerce_mapping(payload.get("anchors")),
             relations=_coerce_mapping(payload.get("relations")),
             metadata=_coerce_mapping(payload.get("metadata")),
+            window_id=str(payload.get("window_id") or ""),
+            chunk_tokens=int(payload.get("chunk_tokens") or estimate_tokens(text)),
         )
 
 
 @dataclass(frozen=True)
 class ChunkConstraints:
-    max_chunk_tokens: int = 800
-    min_chunk_tokens: int = 120
-    max_segments_per_request: int = 8
+    max_chunk_tokens: int = 350
+    min_chunk_tokens: int = 80
+    max_segments_per_request: int = 6
+    window_lines: int = 120
+    overlap_lines: int = 5
 
     def to_dict(self) -> dict[str, int]:
         return {
             "max_chunk_tokens": int(self.max_chunk_tokens),
             "min_chunk_tokens": int(self.min_chunk_tokens),
             "max_segments_per_request": int(self.max_segments_per_request),
+            "window_lines": int(self.window_lines),
+            "overlap_lines": int(self.overlap_lines),
         }
 
 

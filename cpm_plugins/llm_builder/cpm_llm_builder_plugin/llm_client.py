@@ -4,16 +4,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 import random
 import re
 import time
 from typing import Any, Mapping, Sequence
 import json
 import uuid
+import warnings
 
 import requests
 
-from .schemas import Chunk, ChunkConstraints, Segment, SourceDocument, normalize_chunk_list
+from .schemas import Chunk, ChunkConstraints, Segment, SourceDocument, Window, normalize_chunk_list, estimate_tokens
 
 
 @dataclass(frozen=True)
@@ -28,11 +30,49 @@ class LLMClientConfig:
     verbose: bool = True
 
 
+def _load_prompt(prompt_filename: str) -> str:
+    """Load prompt template from prompts/ directory."""
+    try:
+        # Try to find prompts directory relative to this file
+        current_file = Path(__file__).resolve()
+        prompts_dir = current_file.parent / "prompts"
+        prompt_path = prompts_dir / prompt_filename
+
+        if prompt_path.exists():
+            return prompt_path.read_text(encoding="utf-8")
+    except Exception:
+        pass
+
+    # Fallback: inline minimal prompt
+    return (
+        f"You are a chunk enrichment model. "
+        "Return ONLY valid JSON object with key 'chunks'. "
+        "For each input include: id,title,summary,tags,anchors,text,relations."
+    )
+
+
 def _prompt_text(prompt_version: str) -> str:
+    """Legacy prompt text for backward compatibility."""
     return (
         f"prompt={prompt_version}. "
         "Return ONLY valid JSON object with key 'chunks'. "
         "For each input segment include: id,title,summary,tags,anchors,text,relations."
+    )
+
+
+def _is_context_overflow(exc: Exception) -> bool:
+    """Check if exception indicates context length exceeded."""
+    msg = str(exc).lower()
+    return any(
+        kw in msg
+        for kw in (
+            "context_length",
+            "too long",
+            "max_tokens",
+            "token limit",
+            "context window",
+            "maximum context",
+        )
     )
 
 
@@ -199,6 +239,129 @@ class LLMClient:
         ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         print(f"[llm:{ts}] {message}")
 
+    def chunk_and_enrich(
+        self,
+        *,
+        source: SourceDocument,
+        window: Window,
+        constraints: ChunkConstraints,
+        language_hints: str = "",
+    ) -> list[Chunk]:
+        """
+        New method: LLM-first chunking strategy.
+        Given a Window, ask the LLM to identify chunk boundaries AND enrich.
+
+        Returns:
+            List of enriched chunks with accurate boundaries determined by LLM
+        """
+        request_id = uuid.uuid4().hex[:12]
+        self._log(
+            f"request_id={request_id} window={window.id} "
+            f"lines={window.start_line}-{window.end_line} model={self.config.model}"
+        )
+
+        # Build payload using new chunk_and_enrich_v2 prompt
+        prompt_template = _load_prompt("chunk_and_enrich_v2.txt")
+        system_prompt = prompt_template.replace("{language_hints}", language_hints or "None")
+
+        task_payload = {
+            "source": {
+                "path": source.path,
+                "language": source.language,
+                "mime": source.mime,
+                "hash": source.source_hash,
+            },
+            "window": window.to_dict(),
+            "constraints": constraints.to_dict(),
+        }
+
+        compact_user_payload = json.dumps(task_payload, ensure_ascii=False, separators=(",", ":"))
+
+        payload = {
+            "model": self.config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": compact_user_payload},
+            ],
+            "temperature": 0,
+            "stream": False,
+        }
+
+        prompt_chars = len(system_prompt) + len(compact_user_payload)
+        self._log(f"request_id={request_id} prompt_chars={prompt_chars}")
+
+        last_exc: Exception | None = None
+        for attempt in range(self.config.max_retries + 1):
+            try:
+                self._log(
+                    f"request_id={request_id} attempt={attempt + 1} endpoint={self.config.endpoint}"
+                )
+                response = requests.post(
+                    self.config.endpoint,
+                    json=payload,
+                    timeout=self.config.request_timeout,
+                )
+                response.raise_for_status()
+                self._log(
+                    f"request_id={request_id} status={response.status_code} bytes={len(response.text)}"
+                )
+
+                parsed = self._parse_chat_completions_payload(response.json())
+                chunks = normalize_chunk_list(parsed)
+
+                if not chunks:
+                    raise ValueError("empty chunks in LLM response")
+
+                # Set window_id and chunk_tokens for each chunk
+                enriched: list[Chunk] = []
+                for chunk in chunks:
+                    chunk_tokens = estimate_tokens(chunk.text)
+                    enriched.append(
+                        Chunk(
+                            id=chunk.id or f"{window.id}:chunk:{len(enriched)}",
+                            text=chunk.text,
+                            title=chunk.title,
+                            summary=chunk.summary or _default_summary(chunk.text),
+                            tags=chunk.tags or _default_tags_window(source, window),
+                            anchors=chunk.anchors or {
+                                "path": source.path,
+                                "start_line": window.start_line,
+                                "end_line": window.end_line,
+                            },
+                            relations=chunk.relations,
+                            metadata=chunk.metadata,
+                            window_id=window.id,
+                            chunk_tokens=chunk_tokens,
+                        )
+                    )
+
+                self._log(f"request_id={request_id} chunks_returned={len(enriched)}")
+                return enriched
+
+            except Exception as exc:
+                last_exc = exc
+                self._log(f"request_id={request_id} attempt={attempt + 1} error={exc}")
+
+                # Check for context overflow
+                if _is_context_overflow(exc):
+                    self._log(f"request_id={request_id} detected context overflow")
+                    # Caller should reduce window size and retry
+                    raise ValueError(f"Context window exceeded for window {window.id}") from exc
+
+                if isinstance(exc, ValueError):
+                    # Parsing errors are deterministic, no point retrying
+                    break
+
+                if attempt >= self.config.max_retries:
+                    break
+
+                base = self.config.retry_backoff_seconds * (2**attempt)
+                jitter = random.uniform(0.0, 0.25)
+                time.sleep(base + jitter)
+
+        assert last_exc is not None
+        raise last_exc
+
     def enrich(
         self,
         *,
@@ -206,6 +369,17 @@ class LLMClient:
         segments: Sequence[Segment],
         constraints: ChunkConstraints,
     ) -> list[Chunk]:
+        """
+        Legacy method: Enrich pre-computed segments.
+        Maintained for backward compatibility.
+
+        DEPRECATED: Use chunk_and_enrich() with Window for better results.
+        """
+        warnings.warn(
+            "enrich() is deprecated, use chunk_and_enrich() with Window instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if not segments:
             return []
         styles = _preferred_styles(self.config.endpoint, self.config.api_style)
@@ -371,6 +545,20 @@ def _default_tags(*, source: SourceDocument, segment: Segment | None) -> tuple[s
         tags.append(source.language.lower())
     if segment is not None and segment.kind:
         tags.append(segment.kind.lower())
+    if source.mime:
+        mime_tail = source.mime.split("/")[-1].strip().lower()
+        if mime_tail and mime_tail not in tags:
+            tags.append(mime_tail)
+    return tuple(tags[:5])
+
+
+def _default_tags_window(source: SourceDocument, window: Window) -> tuple[str, ...]:
+    """Default tags for chunks from a window."""
+    tags: list[str] = []
+    if source.language:
+        tags.append(source.language.lower())
+    if window.metadata.get("pipeline"):
+        tags.append(str(window.metadata["pipeline"]).lower())
     if source.mime:
         mime_tail = source.mime.split("/")[-1].strip().lower()
         if mime_tail and mime_tail not in tags:

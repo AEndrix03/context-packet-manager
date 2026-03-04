@@ -24,12 +24,13 @@ from cpm_core.build.builder import (
 )
 from cpm_core.packet.models import DocChunk, PacketManifest
 
-from .cache import CacheV2, FileCacheEntry, load_cache, save_cache
-from .classifiers import classify_file
+from .cache import CacheV3, FileCacheEntry, WindowCacheEntry, load_cache, save_cache, window_cache_key
+from .classifiers import classify_file, language_hints
 from .llm_client import LLMClient, LLMClientConfig
-from .postprocess import apply_chunk_constraints
+from .postprocess import apply_chunk_constraints, deduplicate_by_anchor
 from .prechunk import prechunk
-from .schemas import Chunk, ChunkConstraints, SourceDocument, segment_cache_key
+from .splitter import split_into_windows
+from .schemas import Chunk, ChunkConstraints, SourceDocument, Window, estimate_tokens
 from .validators import validate_chunks
 
 SUPPORTED_EXTS = CODE_EXTS | TEXT_EXTS | {".md", ".markdown", ".html", ".htm", ".json", ".yaml", ".yml"}
@@ -183,6 +184,8 @@ class CPMLLMBuilder(CPMAbstractBuilder):
             max_segments_per_request=int(
                 getattr(args, "max_segments_per_request", None) or base.max_segments_per_request
             ),
+            window_lines=120,
+            overlap_lines=5,
         )
 
         destination_path = Path(str(getattr(args, "destination", "")))
@@ -222,6 +225,7 @@ class CPMLLMBuilder(CPMAbstractBuilder):
         return 0 if manifest is not None else 1
 
     def _fallback_chunk(self, *, source: SourceDocument, segment_text: str, segment_id: str, start: int, end: int) -> Chunk:
+        """Legacy fallback for segment-based processing."""
         return Chunk(
             id=segment_id,
             text=segment_text,
@@ -232,6 +236,60 @@ class CPMLLMBuilder(CPMAbstractBuilder):
             relations={},
             metadata={"fallback": True},
         )
+
+    def _fallback_chunks_from_window(self, *, window: Window, source: SourceDocument) -> list[Chunk]:
+        """
+        Emergency fallback: create deterministic chunks from window without LLM.
+
+        Strategy: Split by paragraph (double newline) or every 200 lines.
+        """
+        import re
+
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", window.text) if p.strip()]
+
+        if not paragraphs:
+            # Single block fallback
+            return [
+                Chunk(
+                    id=f"{window.id}:fallback:0",
+                    text=window.text,
+                    title="Fallback chunk",
+                    summary=window.text[:150],
+                    tags=(source.language, "fallback"),
+                    anchors={
+                        "path": source.path,
+                        "start_line": window.start_line,
+                        "end_line": window.end_line,
+                    },
+                    relations={},
+                    metadata={"fallback": True, "reason": "llm_failed"},
+                    window_id=window.id,
+                    chunk_tokens=estimate_tokens(window.text),
+                )
+            ]
+
+        chunks: list[Chunk] = []
+        for idx, para in enumerate(paragraphs):
+            chunks.append(
+                Chunk(
+                    id=f"{window.id}:fallback:{idx}",
+                    text=para,
+                    title="Fallback chunk",
+                    summary=para[:150],
+                    tags=(source.language, "paragraph", "fallback"),
+                    anchors={
+                        "path": source.path,
+                        "start_line": window.start_line,
+                        "end_line": window.end_line,
+                    },
+                    relations={},
+                    metadata={"fallback": True, "reason": "llm_failed"},
+                    window_id=window.id,
+                    chunk_tokens=estimate_tokens(para),
+                )
+            )
+
+        return chunks
 
     def build(self, source: str, *, destination: str | None = None) -> PacketManifest | None:
         if self.config is None:
@@ -269,15 +327,15 @@ class CPMLLMBuilder(CPMAbstractBuilder):
 
         chunk_cache_path = out_root / CHUNK_CACHE_NAME
         cache = load_cache(chunk_cache_path)
-        next_cache = CacheV2()
-        next_cache.segment_enrichment.update(cache.segment_enrichment)
+        next_cache = CacheV3()
 
         chunks: list[DocChunk] = []
         ext_counts: dict[str, int] = {}
         files_indexed = 0
         llm_calls = 0
         file_cache_hits = 0
-        segment_cache_hits = 0
+        window_cache_hits = 0
+        window_cache_misses = 0
 
         rel_root = source_path.resolve()
         for file_path in sorted(source_path.rglob("*")):
@@ -305,27 +363,6 @@ class CPMLLMBuilder(CPMAbstractBuilder):
                 continue
 
             source_hash = _sha256_text(text)
-            cached_file = cache.files.get(rel)
-            if cached_file and cached_file.source_hash == source_hash:
-                segments = cached_file.segments
-                file_cache_hits += 1
-                self._log("prechunk", f"path={rel} source_cache_hit segments={len(segments)}")
-            else:
-                segments = prechunk(rel, text, classification)
-                self._log("prechunk", f"path={rel} source_cache_miss segments={len(segments)}")
-
-            next_cache.files[rel] = FileCacheEntry(
-                source_hash=source_hash,
-                classification={
-                    "pipeline": classification.pipeline,
-                    "language": classification.language,
-                    "mime": classification.mime,
-                },
-                segments=list(segments),
-            )
-            if not segments:
-                continue
-
             source_doc = SourceDocument(
                 path=rel,
                 language=classification.language,
@@ -333,70 +370,129 @@ class CPMLLMBuilder(CPMAbstractBuilder):
                 source_hash=source_hash,
             )
 
-            resolved_chunks: list[Chunk] = []
-            missing_segments = []
-            missing_keys = []
-            for segment in segments:
-                key = segment_cache_key(
-                    segment=segment,
-                    model=self.config.llm_model,
-                    prompt_version=self.config.prompt_version,
-                    constraints=self.config.constraints,
-                )
-                cached = cache.segment_enrichment.get(key)
-                if cached is not None:
-                    resolved_chunks.append(cached)
-                    segment_cache_hits += 1
-                else:
-                    missing_segments.append(segment)
-                    missing_keys.append(key)
-            self._log(
-                "cache",
-                f"path={rel} segments_total={len(segments)} segment_cache_hits={len(segments)-len(missing_segments)} "
-                f"segment_cache_miss={len(missing_segments)}",
-            )
+            # Check file-level cache
+            cached_file = cache.files.get(rel)
+            if cached_file and cached_file.source_hash == source_hash:
+                # File unchanged, reuse cached windows
+                file_cache_hits += 1
+                self._log("cache", f"path={rel} file_cache_hit")
 
-            max_batch = max(1, self.config.constraints.max_segments_per_request)
-            for start in range(0, len(missing_segments), max_batch):
-                segment_batch = missing_segments[start : start + max_batch]
-                key_batch = missing_keys[start : start + max_batch]
+                # Reconstruct chunks from cached windows
+                all_chunks: list[Chunk] = []
+                for win_entry in cached_file.windows:
+                    all_chunks.extend(win_entry.chunks)
+
+                # Skip to postprocessing
+                post = deduplicate_by_anchor(all_chunks)
+                post = apply_chunk_constraints(post, self.config.constraints)
+                post = sorted(post, key=lambda c: c.anchors.get("start_line", 0))
+
+                validation = validate_chunks(
+                    post,
+                    max_chunk_tokens=self.config.constraints.max_chunk_tokens,
+                    min_chunk_tokens=self.config.constraints.min_chunk_tokens,
+                )
+                for warning in validation.warnings:
+                    print(f"[warn] {rel}: {warning}")
+
+                # Store updated cache entry
+                # (Windows are already cached, just update metadata)
+                next_cache.files[rel] = cached_file
+
+            else:
+                # File changed or new: process with new pipeline
+                self._log("split", f"path={rel} file_cache_miss, creating windows")
+
+                # Step 1: Split into windows
+                windows = split_into_windows(rel, text, classification, self.config.constraints)
+                self._log("split", f"path={rel} windows_created={len(windows)}")
+
+                # Step 2: Process each window
+                all_chunks: list[Chunk] = []
+                window_entries: list[WindowCacheEntry] = []
+                hints = language_hints(classification)
+
+                for window in windows:
+                    win_key = window_cache_key(window, self.config.llm_model, self.config.prompt_version)
+
+                    # Check window-level cache
+                    cached_win = None
+                    if cached_file:
+                        for win_entry in cached_file.windows:
+                            if win_entry.window_hash == win_key:
+                                cached_win = win_entry
+                                break
+
+                    if cached_win:
+                        window_cache_hits += 1
+                        self._log("cache", f"window={window.id} cache_hit chunks={len(cached_win.chunks)}")
+                        all_chunks.extend(cached_win.chunks)
+                        window_entries.append(cached_win)
+                    else:
+                        window_cache_misses += 1
+                        self._log("llm", f"window={window.id} cache_miss, calling LLM")
+
+                        try:
+                            window_chunks = llm_client.chunk_and_enrich(
+                                source=source_doc,
+                                window=window,
+                                constraints=self.config.constraints,
+                                language_hints=hints,
+                            )
+                            llm_calls += 1
+                            self._log("llm", f"window={window.id} chunks_returned={len(window_chunks)}")
+
+                        except Exception as exc:
+                            self._log("llm", f"window={window.id} LLM failed: {exc}, using fallback")
+                            window_chunks = self._fallback_chunks_from_window(window=window, source=source_doc)
+
+                        all_chunks.extend(window_chunks)
+
+                        # Cache this window's result
+                        window_entries.append(WindowCacheEntry(window_hash=win_key, chunks=window_chunks))
+
+                # Step 3: Deduplicate overlapping chunks
+                self._log("postprocess", f"path={rel} total_chunks={len(all_chunks)} (before dedup)")
+                all_chunks = deduplicate_by_anchor(all_chunks)
+                self._log("postprocess", f"path={rel} after_dedup={len(all_chunks)}")
+
+                # Step 4: Apply size constraints
+                post = apply_chunk_constraints(all_chunks, self.config.constraints)
+                post = sorted(post, key=lambda c: c.anchors.get("start_line", 0))
                 self._log(
-                    "llm",
-                    f"path={rel} batch_start={start} batch_size={len(segment_batch)} model={self.config.llm_model}",
+                    "postprocess",
+                    f"path={rel} after_constraints={len(post)} "
+                    f"max={self.config.constraints.max_chunk_tokens} min={self.config.constraints.min_chunk_tokens}",
                 )
-                try:
-                    enriched = llm_client.enrich(
-                        source=source_doc,
-                        segments=segment_batch,
-                        constraints=self.config.constraints,
-                    )
-                    llm_calls += 1
-                    self._log("llm", f"path={rel} batch_start={start} enriched={len(enriched)}")
-                except Exception as exc:
-                    print(f"[warn] llm enrichment failed for {rel}: {exc}; fallback enabled")
-                    enriched = [
-                        self._fallback_chunk(
-                            source=source_doc,
-                            segment_text=segment.text,
-                            segment_id=segment.id,
-                            start=segment.start_line,
-                            end=segment.end_line,
-                        )
-                        for segment in segment_batch
-                    ]
-                for key, enriched_chunk in zip(key_batch, enriched):
-                    next_cache.segment_enrichment[key] = enriched_chunk
-                    resolved_chunks.append(enriched_chunk)
 
-            post = apply_chunk_constraints(resolved_chunks, self.config.constraints)
-            self._log(
-                "postprocess",
-                f"path={rel} before={len(resolved_chunks)} after={len(post)} "
-                f"max_tokens={self.config.constraints.max_chunk_tokens} min_tokens={self.config.constraints.min_chunk_tokens}",
-            )
-            validation = validate_chunks(post)
-            for warning in validation.warnings:
-                print(f"[warn] {rel}: {warning}")
+                # Step 5: Validate
+                validation = validate_chunks(
+                    post,
+                    max_chunk_tokens=self.config.constraints.max_chunk_tokens,
+                    min_chunk_tokens=self.config.constraints.min_chunk_tokens,
+                )
+                for warning in validation.warnings:
+                    print(f"[warn] {rel}: {warning}")
+
+                # Log stats
+                stats = validation.stats
+                self._log(
+                    "stats",
+                    f"path={rel} chunks={stats.total} avg_tokens={stats.avg_tokens:.1f} "
+                    f"min={stats.min_tokens} max={stats.max_tokens} "
+                    f"oversized={stats.oversized} undersized={stats.undersized}",
+                )
+
+                # Store in cache
+                next_cache.files[rel] = FileCacheEntry(
+                    source_hash=source_hash,
+                    classification={
+                        "pipeline": classification.pipeline,
+                        "language": classification.language,
+                        "mime": classification.mime,
+                    },
+                    windows=window_entries,
+                )
 
             for chunk in validation.chunks:
                 meta = dict(chunk.metadata)
@@ -419,7 +515,8 @@ class CPMLLMBuilder(CPMAbstractBuilder):
         self._log("scan", f"chunks_total={len(chunks)}")
         self._log(
             "scan",
-            f"llm_calls={llm_calls} file_cache_hits={file_cache_hits} segment_cache_hits={segment_cache_hits}",
+            f"llm_calls={llm_calls} file_cache_hits={file_cache_hits} "
+            f"window_cache_hits={window_cache_hits} window_cache_misses={window_cache_misses}",
         )
         description = (self.config.description or source_path.as_posix()).strip() or source_path.as_posix()
         packet_name = (self.config.packet_name or out_root.name).strip() or out_root.name
@@ -444,7 +541,8 @@ class CPMLLMBuilder(CPMAbstractBuilder):
                     "llm_builder": {
                         "llm_calls": llm_calls,
                         "file_cache_hits": file_cache_hits,
-                        "segment_cache_hits": segment_cache_hits,
+                        "window_cache_hits": window_cache_hits,
+                        "window_cache_misses": window_cache_misses,
                     }
                 },
             )
@@ -455,7 +553,8 @@ class CPMLLMBuilder(CPMAbstractBuilder):
         manifest.incremental.update(
             {
                 "file_cache_hits": file_cache_hits,
-                "segment_cache_hits": segment_cache_hits,
+                "window_cache_hits": window_cache_hits,
+                "window_cache_misses": window_cache_misses,
                 "llm_calls": llm_calls,
             }
         )

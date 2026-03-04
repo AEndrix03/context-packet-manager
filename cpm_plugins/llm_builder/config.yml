@@ -1,13 +1,15 @@
 llm:
   endpoint: "http://localhost:11434/v1/chat/completions"
   model: "qwen2.5:1.5b-instruct"
-  prompt_version: "chunk_enrich_v1"
+  prompt_version: "chunk_and_enrich_v2"  # UPDATED: New prompt version
   api_style: "auto"
-  max_retries: 1
+  max_retries: 2  # UPDATED: More retries for reliability
 
 request_timeout: 120.0
 
 constraints:
-  max_chunk_tokens: 800
-  min_chunk_tokens: 120
-  max_segments_per_request: 8
+  max_chunk_tokens: 350  # UPDATED: Optimal for RAG (was 800)
+  min_chunk_tokens: 80   # UPDATED: Smaller min (was 120)
+  max_segments_per_request: 6  # UPDATED: Fewer per batch (was 8)
+  window_lines: 120      # NEW: Lines per window
+  overlap_lines: 5       # NEW: Overlap between windows
