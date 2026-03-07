@@ -177,8 +177,11 @@ class OciClient:
         fail_on_last: bool = True,
         cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        base_redacted = " ".join(redact_command_for_log(command))
         if self.config.insecure:
             command = [*command, "--insecure"]
+        if self.config.plain_http:
+            command = [*command, "--plain-http"]
         if self.config.username and self.config.password:
             command = [*command, "--username", self.config.username, "--password", self.config.password]
         elif self.config.token:
@@ -193,6 +196,7 @@ class OciClient:
             try:
                 redacted = " ".join(redact_command_for_log(command))
                 logger.debug("oci command attempt=%s/%s cmd=%s", attempt, retries, redacted)
+                started = time.monotonic()
                 result = subprocess.run(
                     command,
                     check=False,
@@ -200,6 +204,15 @@ class OciClient:
                     text=True,
                     timeout=timeout,
                     cwd=str(cwd) if cwd is not None else None,
+                )
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                logger.debug(
+                    "oci command done attempt=%s/%s exit=%s elapsed_ms=%s cmd=%s",
+                    attempt,
+                    retries,
+                    result.returncode,
+                    elapsed_ms,
+                    redacted,
                 )
                 if result.returncode == 0:
                     return result
@@ -212,7 +225,9 @@ class OciClient:
             except subprocess.TimeoutExpired as exc:
                 last_error = exc
                 if attempt >= retries:
-                    raise OciCommandError(f"oras command timed out after {timeout:.1f}s") from exc
+                    raise OciCommandError(
+                        f"oras command timed out after {timeout:.1f}s (attempt={attempt}/{retries}, cmd='{base_redacted}')"
+                    ) from exc
             if attempt < retries:
                 time.sleep(min(backoff * attempt, 2.0))
         if isinstance(last_error, Exception):

@@ -24,6 +24,14 @@ Compatibility fallbacks:
 - `RAG_EMBED_URL`
 - `RAG_EMBED_MODE`
 
+Resolver OCI options (from `CPM_ROOT/config/config.toml`, `[oci]` section):
+
+- `timeout_seconds` and `max_retries` for fail-fast lookup/query behavior
+- `insecure` for insecure TLS
+- `plain_http` for HTTP-only local registries
+
+Lookup diagnostics are appended to `CPM_ROOT/logs/mcp-lookup.log`.
+
 ## Start
 
 ```powershell

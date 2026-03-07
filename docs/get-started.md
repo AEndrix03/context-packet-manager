@@ -71,6 +71,7 @@ cpm benchmark --packet my-docs --query "auth" --runs 5
 - If OCI policy fails: check `.cpm/policy.yml` and optional `[hub]` settings in `.cpm/config/config.toml`.
 - If OCI query/publish fails with `basic credential not found`: your registry requires auth (`docker login <registry-host>`) or set `[oci].username/password` in `.cpm/config/config.toml`.
 - For local dev registries without attestations, relax OCI verification in `.cpm/config/config.toml` with `[oci] strict_verify = false` (optionally also disable `require_signature/sbom/provenance`).
+- If MCP lookup times out against local registries, set `[oci] plain_http = true` when registry serves HTTP and prefer `REGISTRY=host.docker.internal:<port>` if MCP runs in an isolated runtime.
 
 ## Where to go next
 

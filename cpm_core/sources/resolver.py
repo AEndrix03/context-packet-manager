@@ -49,12 +49,16 @@ class OciSource:
 
     def _client(self) -> OciClient:
         config = _load_oci_config(self.workspace_root)
+        # Resolver calls back MCP lookup/query and should fail fast on network issues.
+        timeout_seconds = float(config.get("timeout_seconds", 10.0))
+        max_retries = int(config.get("max_retries", 1))
         return OciClient(
             OciClientConfig(
-                timeout_seconds=float(config.get("timeout_seconds", 30.0)),
-                max_retries=int(config.get("max_retries", 2)),
+                timeout_seconds=timeout_seconds,
+                max_retries=max_retries,
                 backoff_seconds=float(config.get("backoff_seconds", 0.2)),
                 insecure=bool(config.get("insecure", False)),
+                plain_http=bool(config.get("plain_http", False)),
                 allowlist_domains=tuple(str(item) for item in config.get("allowlist_domains", []) if str(item).strip()),
                 max_artifact_size_bytes=(
                     int(config["max_artifact_size_bytes"])

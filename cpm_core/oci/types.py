@@ -13,6 +13,7 @@ class OciClientConfig:
     max_retries: int = 2
     backoff_seconds: float = 0.2
     insecure: bool = False
+    plain_http: bool = False
     allowlist_domains: tuple[str, ...] = ()
     max_artifact_size_bytes: int | None = None
     username: str | None = None

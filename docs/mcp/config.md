@@ -28,3 +28,14 @@ MCP runtime is configured with environment variables.
 - `cas/<digest>/payload/`: lazy materialized packet payload.
 - `index/<digest>/<embedding_fingerprint>/`: index cache.
 - `meta/<digest>/packet.manifest.json`: normalized metadata copy.
+- `logs/mcp-lookup.log`: lookup attempt diagnostics (attempt/failure/success).
+
+## OCI Runtime Tuning (`CPM_ROOT/config/config.toml`)
+
+`lookup/query` resolver reads optional `[oci]` settings:
+
+- `timeout_seconds` (default `10.0` in resolver path)
+- `max_retries` (default `1` in resolver path)
+- `backoff_seconds` (default `0.2`)
+- `insecure` (append `--insecure` to ORAS commands)
+- `plain_http` (append `--plain-http` to ORAS commands)

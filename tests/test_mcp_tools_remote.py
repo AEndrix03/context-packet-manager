@@ -72,6 +72,67 @@ def test_lookup_remote_uses_registry_env_and_alias_cache(monkeypatch, tmp_path: 
     assert calls["lookup"] == 1
 
 
+def test_lookup_remote_falls_back_from_localhost_to_host_docker_internal(monkeypatch, tmp_path: Path) -> None:
+    cpm_root = tmp_path / ".cpm"
+    monkeypatch.setenv("CPM_ROOT", str(cpm_root))
+    monkeypatch.setenv("REGISTRY", "localhost:5000")
+    calls: list[str] = []
+
+    class _FakeResolver:
+        def __init__(self, workspace_root: Path):
+            self.workspace_root = workspace_root
+
+        def lookup_metadata(self, uri: str):
+            calls.append(uri)
+            if "localhost:5000" in uri:
+                raise TimeoutError("oras command timed out after 10.0s")
+            reference = PacketReference(
+                uri=uri,
+                resolved_uri=uri,
+                digest="sha256:" + ("c" * 64),
+                metadata={
+                    "ref": "host.docker.internal:5000/demo:latest",
+                    "metadata_digest": "sha256:" + ("d" * 64),
+                },
+            )
+            metadata = {"packet": {"name": "demo", "version": "1.0.0", "entrypoints": ["query"]}}
+            return reference, metadata
+
+    monkeypatch.setattr(remote, "SourceResolver", _FakeResolver)
+    payload = remote.lookup_remote(name="demo", alias="latest")
+
+    assert payload["ok"] is True
+    assert payload["resolved_source_uri"] == "oci://host.docker.internal:5000/demo:latest"
+    assert calls == [
+        "oci://localhost:5000/demo:latest",
+        "oci://host.docker.internal:5000/demo:latest",
+    ]
+
+
+def test_lookup_remote_writes_failure_log_and_hint(monkeypatch, tmp_path: Path) -> None:
+    cpm_root = tmp_path / ".cpm"
+    monkeypatch.setenv("CPM_ROOT", str(cpm_root))
+    monkeypatch.setenv("REGISTRY", "localhost:5000")
+
+    class _FakeResolver:
+        def __init__(self, workspace_root: Path):
+            self.workspace_root = workspace_root
+
+        def lookup_metadata(self, uri: str):
+            raise TimeoutError("oras command timed out after 10.0s")
+
+    monkeypatch.setattr(remote, "SourceResolver", _FakeResolver)
+    payload = remote.lookup_remote(name="demo", version="1.0.0")
+
+    assert payload["ok"] is False
+    assert payload["error"] == "lookup_failed"
+    assert "host.docker.internal" in str(payload["detail"])
+    log_path = cpm_root / "logs" / "mcp-lookup.log"
+    assert log_path.exists()
+    lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert any('"event": "lookup_failed"' in line for line in lines)
+
+
 def test_query_remote_cache_hit_skips_remote_fetch(monkeypatch, tmp_path: Path) -> None:
     cpm_root = tmp_path / ".cpm"
     digest = "sha256:" + ("1" * 64)

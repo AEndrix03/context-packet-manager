@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import time
@@ -18,6 +19,7 @@ from cpm_core.sources.resolver import SourceResolver
 
 from .env import MCPSettings, load_settings
 
+logger = logging.getLogger(__name__)
 _LOOKUP_ALIAS_TTL_SECONDS = 180
 _MAX_LOOKUP_CANDIDATES = 3
 _MAX_QUERY_K = 20
@@ -90,6 +92,7 @@ def lookup_remote(
             "error": "invalid_lookup_input",
             "detail": "REGISTRY not set and no oci:// ref provided",
         }
+    normalized_capabilities = _normalize_capabilities(capability)
 
     cache_hit, cached_payload = _read_alias_lookup_cache(
         root=settings.cpm_root,
@@ -97,51 +100,98 @@ def lookup_remote(
         is_alias=bool(alias and not version and not ref),
     )
     if cache_hit and isinstance(cached_payload, dict):
+        _lookup_log(
+            root=settings.cpm_root,
+            event="lookup_cache_hit",
+            payload={"source_uri": source_uri},
+        )
         return cached_payload
 
     resolver = SourceResolver(settings.cpm_root)
-    try:
-        reference, metadata = resolver.lookup_metadata(source_uri)
-    except Exception as exc:
-        return {"ok": False, "error": "lookup_failed", "detail": str(exc)}
+    attempt_uris = [source_uri, *_lookup_fallback_source_uris(source_uri)]
+    attempted: list[str] = []
+    failures: list[str] = []
+    for attempt_uri in attempt_uris:
+        if attempt_uri in attempted:
+            continue
+        attempted.append(attempt_uri)
+        _lookup_log(
+            root=settings.cpm_root,
+            event="lookup_attempt",
+            payload={"source_uri": attempt_uri, "attempt": len(attempted)},
+        )
+        started = time.monotonic()
+        try:
+            reference, metadata = resolver.lookup_metadata(attempt_uri)
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            detail = str(exc)
+            failures.append(f"{attempt_uri} -> {detail}")
+            logger.warning("lookup attempt failed source_uri=%s elapsed_ms=%s detail=%s", attempt_uri, elapsed_ms, detail)
+            _lookup_log(
+                root=settings.cpm_root,
+                event="lookup_attempt_failed",
+                payload={"source_uri": attempt_uri, "elapsed_ms": elapsed_ms, "detail": detail},
+            )
+            continue
 
-    candidates = _build_lookup_candidates(reference=reference, metadata=metadata)
-    filtered = _filter_candidates(
-        candidates=candidates,
-        entrypoint=entrypoint,
-        kind=kind,
-        capabilities=_normalize_capabilities(capability),
-        os_name=os_name,
-        arch=arch,
-    )
-    if not filtered:
-        return {
-            "ok": False,
-            "error": "no_match",
-            "detail": _build_no_match_detail(
-                entrypoint=entrypoint,
-                kind=kind,
-                capabilities=_normalize_capabilities(capability),
-                os_name=os_name,
-                arch=arch,
-            ),
+        candidates = _build_lookup_candidates(reference=reference, metadata=metadata)
+        filtered = _filter_candidates(
+            candidates=candidates,
+            entrypoint=entrypoint,
+            kind=kind,
+            capabilities=normalized_capabilities,
+            os_name=os_name,
+            arch=arch,
+        )
+        if not filtered:
+            return {
+                "ok": False,
+                "error": "no_match",
+                "detail": _build_no_match_detail(
+                    entrypoint=entrypoint,
+                    kind=kind,
+                    capabilities=normalized_capabilities,
+                    os_name=os_name,
+                    arch=arch,
+                ),
+            }
+
+        shortlist = filtered[: max(1, min(int(k or 1), _MAX_LOOKUP_CANDIDATES))]
+        payload: dict[str, Any] = {
+            "ok": True,
+            "source_uri": source_uri,
+            "resolved_source_uri": attempt_uri,
+            "count": len(shortlist),
+            "candidates": shortlist,
+            "selected": shortlist[0],
         }
+        _write_alias_lookup_cache(
+            root=settings.cpm_root,
+            source_uri=source_uri,
+            payload=payload,
+            is_alias=bool(alias and not version and not ref),
+        )
+        _lookup_log(
+            root=settings.cpm_root,
+            event="lookup_success",
+            payload={"source_uri": attempt_uri, "count": len(shortlist)},
+        )
+        return payload
 
-    shortlist = filtered[: max(1, min(int(k or 1), _MAX_LOOKUP_CANDIDATES))]
-    payload: dict[str, Any] = {
-        "ok": True,
-        "source_uri": source_uri,
-        "count": len(shortlist),
-        "candidates": shortlist,
-        "selected": shortlist[0],
-    }
-    _write_alias_lookup_cache(
+    hint = _build_lookup_failure_hint(attempted)
+    detail_parts = []
+    if failures:
+        detail_parts.append(" | ".join(failures[-2:]))
+    if hint:
+        detail_parts.append(hint)
+    detail = " ; ".join(part for part in detail_parts if part) or "lookup attempts failed"
+    _lookup_log(
         root=settings.cpm_root,
-        source_uri=source_uri,
-        payload=payload,
-        is_alias=bool(alias and not version and not ref),
+        event="lookup_failed",
+        payload={"source_uri": source_uri, "attempted": attempted, "detail": detail},
     )
-    return payload
+    return {"ok": False, "error": "lookup_failed", "detail": detail}
 
 
 def query_remote(
@@ -718,6 +768,49 @@ def _write_alias_lookup_cache(*, root: Path, source_uri: str, payload: dict[str,
         json.dumps({"expires_at": time.time() + _LOOKUP_ALIAS_TTL_SECONDS, "payload": payload}, ensure_ascii=False, sort_keys=True),
         encoding="utf-8",
     )
+
+
+def _lookup_fallback_source_uris(source_uri: str) -> list[str]:
+    if not source_uri.startswith("oci://"):
+        return []
+    value = source_uri[len("oci://") :]
+    if "/" not in value:
+        return []
+    host, rest = value.split("/", 1)
+    lowered_host = host.lower()
+    aliases: list[str] = []
+    if lowered_host == "localhost":
+        aliases.append(f"host.docker.internal/{rest}")
+    elif lowered_host.startswith("localhost:"):
+        aliases.append(f"host.docker.internal:{host.split(':', 1)[1]}/{rest}")
+    elif lowered_host == "127.0.0.1":
+        aliases.append(f"host.docker.internal/{rest}")
+    elif lowered_host.startswith("127.0.0.1:"):
+        aliases.append(f"host.docker.internal:{host.split(':', 1)[1]}/{rest}")
+    elif lowered_host == "host.docker.internal":
+        aliases.append(f"localhost/{rest}")
+    elif lowered_host.startswith("host.docker.internal:"):
+        aliases.append(f"localhost:{host.split(':', 1)[1]}/{rest}")
+    return [f"oci://{candidate}" for candidate in aliases if f"oci://{candidate}" != source_uri]
+
+
+def _build_lookup_failure_hint(attempted_uris: list[str]) -> str:
+    if any("localhost" in uri for uri in attempted_uris):
+        return "If MCP runs in an isolated runtime, try REGISTRY=host.docker.internal:<port>."
+    if any("host.docker.internal" in uri for uri in attempted_uris):
+        return "If host.docker.internal is unreachable, try REGISTRY=localhost:<port>."
+    return ""
+
+
+def _lookup_log(*, root: Path, event: str, payload: dict[str, Any]) -> None:
+    try:
+        path = root / "logs" / "mcp-lookup.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {"ts": int(time.time()), "event": event, **payload}
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        logger.debug("failed to write lookup log event=%s", event, exc_info=True)
 
 
 def _extract_name_hint(intent: str) -> str | None:
