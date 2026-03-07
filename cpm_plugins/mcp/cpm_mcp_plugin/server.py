@@ -57,6 +57,7 @@ def query(
     ref: str,
     q: str,
     k: int = 5,
+    rerank: bool = True,
     registry: str | None = None,
     cpm_root: str | None = None,
 ) -> Dict[str, Any]:
@@ -65,8 +66,9 @@ def query(
     Use this only when the user asks a content question and you need snippets.
     Prefer passing a digest-pinned `ref` from `lookup.selected.pinned_uri`.
     Do not use this for packet discovery/version/capability lookup.
+    Set `rerank=False` to skip cross-encoder reranking (faster, lower quality).
     """
-    return query_remote(ref=ref, q=q, k=k, registry=registry, cpm_root=cpm_root)
+    return query_remote(ref=ref, q=q, k=k, rerank=rerank, registry=registry, cpm_root=cpm_root)
 
 
 @mcp.tool()

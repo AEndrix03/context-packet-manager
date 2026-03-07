@@ -186,6 +186,12 @@ def _merge_invocation(argv: Any, workspace_root: Path) -> _BuildInvocation:
         _as_int(embedding_data.get("max_seq_length"), DefaultBuilderConfig().max_seq_length),
     )
 
+    cli_max_chunk = getattr(argv, "max_chunk_size", None)
+    max_chunk_size = _as_int(
+        cli_max_chunk,
+        _as_int(chunking_data.get("max_chunk_size"), 300),
+    )
+
     cli_lines = getattr(argv, "lines_per_chunk", None)
     lines_per_chunk = _as_int(
         cli_lines,
@@ -263,6 +269,7 @@ def _merge_invocation(argv: Any, workspace_root: Path) -> _BuildInvocation:
     builder_config = DefaultBuilderConfig(
         model_name=model_name,
         max_seq_length=max_seq_length,
+        max_chunk_size=max_chunk_size,
         lines_per_chunk=lines_per_chunk,
         overlap_lines=overlap_lines,
         version=packet_version,
@@ -444,6 +451,13 @@ class BuildCommand(_WorkspaceAwareCommand):
         parser.add_argument("--description", help="Packet description")
         parser.add_argument("--model", "--model-name", dest="model", help="Embedding model identifier")
         parser.add_argument("--max-seq-length", type=int, help="Maximum tokens per chunk")
+        parser.add_argument(
+            "--max-chunk-size",
+            dest="max_chunk_size",
+            type=int,
+            default=None,
+            help="Max non-whitespace chars per chunk, default 300",
+        )
         parser.add_argument("--lines-per-chunk", type=int, help="Number of lines per chunk")
         parser.add_argument("--overlap-lines", type=int, help="Overlap lines between chunks")
         parser.add_argument("--archive-format", choices=SUPPORTED_ARCHIVE_FORMATS)

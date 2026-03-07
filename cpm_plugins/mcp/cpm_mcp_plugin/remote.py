@@ -149,6 +149,7 @@ def query_remote(
     ref: str,
     q: str,
     k: int = 5,
+    rerank: bool = True,
     registry: str | None = None,
     cpm_root: str | None = None,
 ) -> dict[str, Any]:
@@ -180,6 +181,8 @@ def query_remote(
         embed_url=settings.embedding_url,
         embed_mode=settings.embedding_mode,
         selected_model=settings.embedding_model,
+        indexer="hybrid-rrf",
+        reranker="cpm:cross-encoder" if rerank else "none",
     )
     compressed = _compress_query_results(result.get("results") if isinstance(result, dict) else [])
     payload: dict[str, Any] = {

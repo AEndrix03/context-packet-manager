@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
+import math
 import tarfile
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -15,6 +18,7 @@ import numpy as np
 from cpm_builtin.embeddings import EmbeddingClient
 
 from cpm_core.api import CPMAbstractBuilder, cpmbuilder
+from .ast_chunker import scan_directory
 from cpm_core.packet.faiss_db import FaissFlatIP
 from cpm_core.packet.io import (
     compute_checksums,
@@ -68,6 +72,56 @@ def _chunk_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _embed_resilient(
+    embedder: "Embedder",
+    texts: list[str],
+    chunk_ids: list[str],
+    *,
+    model_name: str,
+    max_seq_length: int,
+) -> tuple[list[int], Optional[np.ndarray], list[str]]:
+    """Embed *texts* with per-chunk fallback on permanent errors.
+
+    Returns ``(good_local_indices, vectors, skipped_ids)``:
+
+    - ``good_local_indices`` : positions in *texts* that were embedded.
+    - ``vectors``            : shape ``(len(good_local_indices), dim)``
+                               or ``None`` if every chunk was skipped.
+    - ``skipped_ids``        : chunk IDs that failed permanently.
+    """
+    _kw: Dict[str, Any] = dict(
+        model_name=model_name,
+        max_seq_length=max_seq_length,
+        normalize=True,
+        dtype="float32",
+        show_progress=False,
+    )
+    try:
+        vecs = embedder.embed_texts(texts, **_kw)
+        return list(range(len(texts))), vecs, []
+    except Exception as exc:
+        print(f"[embed] batch failed ({exc}), falling back to per-chunk ...")
+
+    good_indices: list[int] = []
+    good_vecs: list[np.ndarray] = []
+    skipped: list[str] = []
+    total = len(texts)
+
+    for local_idx, (text, cid) in enumerate(zip(texts, chunk_ids)):
+        print(f"[embed] retry {local_idx + 1}/{total}: {cid}")
+        try:
+            vec = embedder.embed_texts([text], **_kw)
+            good_indices.append(local_idx)
+            good_vecs.append(vec[0])
+        except Exception as chunk_exc:
+            print(f"[embed] skip {cid}: {chunk_exc}")
+            skipped.append(cid)
+
+    if not good_vecs:
+        return [], None, skipped
+    return good_indices, np.vstack([v.reshape(1, -1) for v in good_vecs]), skipped
+
+
 def _read_text_file(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8")
@@ -75,42 +129,145 @@ def _read_text_file(path: Path) -> str:
         return path.read_text(encoding="latin-1")
 
 
+def _load_cpmignore(root: Path) -> list[str]:
+    """Return non-blank, non-comment lines from ``<root>/.cpmignore``."""
+    path = root / ".cpmignore"
+    if not path.exists():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    return [ln.strip() for ln in lines if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _cpmignore_matches(rel_posix: str, patterns: list[str]) -> bool:
+    """Return True if *rel_posix* should be skipped per the .cpmignore patterns.
+
+    Supports the same syntax as .gitignore / .dockerignore:
+    - ``#`` : comment
+    - ``!pattern`` : negate a previous match
+    - trailing ``/`` : directory-only match
+    - ``*`` : any characters except ``/``
+    - ``**`` : any characters including ``/`` (zero or more path segments)
+    - ``?`` : any single character except ``/``
+    - no ``/`` in pattern : matched against each path component (filename or dir name)
+    - ``/`` in pattern : matched against the full relative path
+    """
+    parts = rel_posix.split("/")
+    filename = parts[-1]
+    ignored = False
+
+    for raw in patterns:
+        negate = raw.startswith("!")
+        pat = raw[1:] if negate else raw
+        dir_only = pat.endswith("/")
+        pat = pat.rstrip("/")
+        if not pat:
+            continue
+
+        hit = False
+        if "**" in pat:
+            # Convert ** to a multi-segment wildcard for fnmatch by trying the
+            # pattern against every suffix of the path.
+            flat = pat.replace("**", "*")
+            hit = fnmatch.fnmatch(rel_posix, flat)
+            if not hit:
+                for i in range(len(parts)):
+                    if fnmatch.fnmatch("/".join(parts[i:]), flat):
+                        hit = True
+                        break
+        elif "/" not in pat:
+            # No slash: match filename or any directory component.
+            hit = fnmatch.fnmatch(filename, pat) or any(
+                fnmatch.fnmatch(p, pat) for p in parts[:-1]
+            )
+        else:
+            # Slash present: match against the full relative path.
+            hit = fnmatch.fnmatch(rel_posix, pat)
+            # For dir-only patterns also test path prefixes.
+            if dir_only and not hit:
+                for i in range(1, len(parts)):
+                    if fnmatch.fnmatch("/".join(parts[:i]), pat):
+                        hit = True
+                        break
+
+        if hit:
+            ignored = not negate
+
+    return ignored
+
+
+def _build_bm25_index(chunks: list[DocChunk]) -> dict:
+    """Pre-compute BM25 parameters for sparse/bm25.json.
+
+    Format matches ``_bm25_hits()`` in query.py:
+    ``{avgdl, doc_len, idf, tf}``
+    """
+    tokenized = [chunk.text.lower().split() for chunk in chunks]
+    doc_count = max(len(tokenized), 1)
+    avgdl = sum(len(t) for t in tokenized) / doc_count
+    df: dict[str, int] = {}
+    for tokens in tokenized:
+        for token in set(tokens):
+            df[token] = df.get(token, 0) + 1
+    idf = {
+        term: math.log(1 + (doc_count - freq + 0.5) / (freq + 0.5))
+        for term, freq in df.items()
+    }
+    tf_list = []
+    for tokens in tokenized:
+        counts: dict[str, float] = {}
+        for token in tokens:
+            counts[token] = counts.get(token, 0.0) + 1.0
+        tf_list.append(counts)
+    return {"avgdl": avgdl, "doc_len": [len(t) for t in tokenized], "idf": idf, "tf": tf_list}
+
+
 def _scan_source(
     root: Path,
     *,
-    lines_per_chunk: int,
-    overlap_lines: int,
+    max_chunk_size: int,
+    # Parametri legacy mantenuti per compatibilità firma — ignorati
+    lines_per_chunk: int = 0,
+    overlap_lines: int = 0,
 ) -> tuple[list[DocChunk], Dict[str, int], int]:
     chunks: list[DocChunk] = []
     ext_counts: Dict[str, int] = {}
     rel_root = root.resolve()
     chunk_counter = 0
     files_indexed = 0
+    files_ignored = 0
 
-    for file_path in sorted(root.rglob("*")):
-        if not file_path.is_file():
-            continue
-        ext = file_path.suffix.lower()
-        if ext not in (CODE_EXTS | TEXT_EXTS):
-            continue
-        files_indexed += 1
-        text = _read_text_file(file_path)
-        if not text.strip():
-            continue
+    ignore_patterns = _load_cpmignore(root)
+    if ignore_patterns:
+        print(f"[scan] .cpmignore: {len(ignore_patterns)} pattern(s) loaded")
+
+    for file_path, ext, file_chunks in scan_directory(
+        root, max_chunk_size=max_chunk_size
+    ):
         rel = str(file_path.resolve().relative_to(rel_root)).replace("\\", "/")
+
+        if ignore_patterns and _cpmignore_matches(rel, ignore_patterns):
+            files_ignored += 1
+            continue
+
+        files_indexed += 1
         ext_counts[ext] = ext_counts.get(ext, 0) + 1
-        file_chunks = list(
-            _chunk_text(text, lines_per_chunk=lines_per_chunk, overlap_lines=overlap_lines)
-        )
+
         for chunk_text in file_chunks:
             chunks.append(
                 DocChunk(
                     id=f"{rel}:{chunk_counter}",
                     text=chunk_text,
-                    metadata={"path": rel, "ext": ext},
+                    metadata={"path": rel, "ext": ext, "chunker": "ast"},
                 )
             )
             chunk_counter += 1
+
+    if files_ignored:
+        print(f"[scan] {files_ignored} file(s) skipped via .cpmignore")
+
     return chunks, ext_counts, files_indexed
 
 
@@ -295,8 +452,9 @@ class PacketMaterializationInput:
 class DefaultBuilderConfig:
     model_name: str = DEFAULT_MODEL
     max_seq_length: int = 1024
-    lines_per_chunk: int = 80
-    overlap_lines: int = 10
+    max_chunk_size: int = 300          # sostituisce lines_per_chunk
+    lines_per_chunk: int = 80          # deprecated, ignorato
+    overlap_lines: int = 10            # deprecated, ignorato
     version: str = "0.0.0"
     packet_name: str = "packet"
     description: str | None = None
@@ -418,25 +576,54 @@ def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest
         f"[cache] new_chunks={len(chunks)} reused={reused} to_embed={len(to_embed_idx)} removed={removed}"
     )
 
+    if to_embed_idx:
+        _chunks_per_file: dict[str, int] = {}
+        for idx in to_embed_idx:
+            fp = str(chunks[idx].metadata.get("path", chunks[idx].id))
+            _chunks_per_file[fp] = _chunks_per_file.get(fp, 0) + 1
+        print(f"[embed] {len(to_embed_idx)} chunks to embed from {len(_chunks_per_file)} file(s):")
+        for _fp, _cnt in sorted(_chunks_per_file.items()):
+            print(f"[embed]   {_fp}: {_cnt} chunk{'s' if _cnt != 1 else ''}")
+
     if not input_data.embedder.health():
         print("[error] embedding server is not reachable")
         _write_partial_metadata(reason="embedding server is not reachable")
         return None
 
+    all_skipped_ids: list[str] = []
     vec_missing: Optional[np.ndarray] = None
     dim: Optional[int] = cache_dim
-    try:
-        if to_embed_texts:
-            vec_missing = input_data.embedder.embed_texts(
-                to_embed_texts,
-                model_name=input_data.model_name,
-                max_seq_length=input_data.max_seq_length,
-                normalize=True,
-                dtype="float32",
-                show_progress=True,
-            )
+
+    # --- Main embed batch ---------------------------------------------------
+    if to_embed_texts:
+        to_embed_ids = [chunks[i].id for i in to_embed_idx]
+        print(f"[embed] sending batch: {len(to_embed_texts)} chunks ...")
+        _t0 = time.monotonic()
+        good_local, vec_missing, skipped_ids = _embed_resilient(
+            input_data.embedder,
+            to_embed_texts,
+            to_embed_ids,
+            model_name=input_data.model_name,
+            max_seq_length=input_data.max_seq_length,
+        )
+        _elapsed = time.monotonic() - _t0
+        all_skipped_ids.extend(skipped_ids)
+        to_embed_idx = [to_embed_idx[g] for g in good_local]
+        to_embed_texts = [to_embed_texts[g] for g in good_local]
+        if vec_missing is not None:
             dim = int(vec_missing.shape[1])
-        elif dim is None and chunks:
+            print(f"[embed] done: {len(to_embed_idx)} chunks, dim={dim}, elapsed={_elapsed:.1f}s")
+        elif not cache_vecs:
+            reason = f"all {len(to_embed_ids)} chunks failed to embed"
+            print(f"[error] {reason}")
+            _write_partial_metadata(reason=reason)
+            return None
+
+    # --- Dim probe (all chunks cached, dim still unknown) -------------------
+    elif dim is None and chunks:
+        print("[embed] probing dim with first chunk ...")
+        _t0 = time.monotonic()
+        try:
             vec_missing = input_data.embedder.embed_texts(
                 [chunks[0].text],
                 model_name=input_data.model_name,
@@ -447,29 +634,74 @@ def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest
             )
             dim = int(vec_missing.shape[1])
             to_embed_idx = [0]
-    except Exception as exc:
-        print(f"[error] embedding request failed: {exc}")
-        _write_partial_metadata(reason=f"embedding request failed: {exc}")
+            print(f"[embed] probe done: dim={dim}, elapsed={time.monotonic() - _t0:.1f}s")
+        except Exception as exc:
+            print(f"[embed] probe failed: {exc}")
+            _write_partial_metadata(reason=f"embedding request failed: {exc}")
+            return None
+
+    if dim is None:
+        reason = "could not determine embedding dimension"
+        print(f"[error] {reason}")
+        _write_partial_metadata(reason=reason)
         return None
 
-    assert dim is not None
-
+    # --- Dim-mismatch fallback: re-embed everything -------------------------
     if cache_dim is not None and cache_dim != dim:
-        print(f"[cache] dim mismatch: cache_dim={cache_dim} new_dim={dim} -> cache disabled")
+        print(f"[cache] dim mismatch: cache_dim={cache_dim} new_dim={dim} -> cache disabled, re-embedding all {len(chunks)} chunks")
         cache_vecs = {}
         reused = 0
-        to_embed_idx = list(range(len(chunks)))
-        to_embed_texts = [chunk.text for chunk in chunks]
-        vec_missing = input_data.embedder.embed_texts(
-            to_embed_texts,
+        all_ids = [c.id for c in chunks]
+        all_texts = [c.text for c in chunks]
+        print(f"[embed] sending batch: {len(all_texts)} chunks ...")
+        _t0 = time.monotonic()
+        good_local2, vec_missing, skipped_ids2 = _embed_resilient(
+            input_data.embedder,
+            all_texts,
+            all_ids,
             model_name=input_data.model_name,
             max_seq_length=input_data.max_seq_length,
-            normalize=True,
-            dtype="float32",
-            show_progress=True,
         )
-        dim = int(vec_missing.shape[1])
+        _elapsed = time.monotonic() - _t0
+        all_skipped_ids.extend(skipped_ids2)
+        to_embed_idx = good_local2
+        to_embed_texts = [all_texts[g] for g in good_local2]
+        if vec_missing is not None:
+            dim = int(vec_missing.shape[1])
+            print(f"[embed] done: {len(to_embed_idx)} chunks, dim={dim}, elapsed={_elapsed:.1f}s")
 
+    # --- Filter out permanently skipped chunks ------------------------------
+    if all_skipped_ids:
+        skipped_set = set(all_skipped_ids)
+        id_to_abs = {c.id: i for i, c in enumerate(chunks)}
+        skipped_abs = {id_to_abs[sid] for sid in skipped_set if sid in id_to_abs}
+        if skipped_abs:
+            kept = [i for i in range(len(chunks)) if i not in skipped_abs]
+            old_to_new = {old: new for new, old in enumerate(kept)}
+            chunks = [chunks[i] for i in kept]
+            new_hashes = [new_hashes[i] for i in kept]
+            to_embed_idx = [old_to_new[i] for i in to_embed_idx if i in old_to_new]
+            write_docs_jsonl(chunks, docs_path)
+            print(
+                f"[embed] {len(skipped_abs)} chunk(s) skipped; "
+                f"docs.jsonl rewritten with {len(chunks)} chunk(s)"
+            )
+
+    if not chunks:
+        reason = "all chunks failed to embed"
+        print(f"[error] {reason}")
+        _write_partial_metadata(reason=reason)
+        return None
+
+    # --- Build BM25 sparse index --------------------------------------------
+    sparse_dir = out_root / "sparse"
+    sparse_dir.mkdir(parents=True, exist_ok=True)
+    bm25_path = sparse_dir / "bm25.json"
+    bm25_data = _build_bm25_index(chunks)
+    bm25_path.write_text(json.dumps(bm25_data, ensure_ascii=False), encoding="utf-8")
+    print(f"[write] sparse/bm25.json -> {bm25_path} ({len(chunks)} docs)")
+
+    # --- Assemble final vectors ---------------------------------------------
     final_vecs = np.empty((len(chunks), dim), dtype=np.float32)
     if cache_vecs:
         for idx, hsh in enumerate(new_hashes):
@@ -524,6 +756,7 @@ def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest
             "docs": "docs.jsonl",
             "vectors": {"path": "vectors.f16.bin", "format": "f16_rowmajor"},
             "index": {"path": "faiss/index.faiss", "format": "faiss"},
+            "sparse": {"path": "sparse/bm25.json", "format": "bm25_json"},
             "calibration": None,
         },
         counts={"docs": len(chunks), "vectors": int(db.index.ntotal)},
@@ -548,8 +781,11 @@ def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest
     )
     if input_data.extra_manifest:
         manifest.extras.update(dict(input_data.extra_manifest))
+    if all_skipped_ids:
+        manifest.extras["skipped_chunks"] = all_skipped_ids
+        manifest.extras["skipped_chunks_count"] = len(all_skipped_ids)
 
-    checksum_targets = ["cpm.yml", "docs.jsonl", "vectors.f16.bin", "faiss/index.faiss", *input_data.extra_files]
+    checksum_targets = ["cpm.yml", "docs.jsonl", "vectors.f16.bin", "faiss/index.faiss", "sparse/bm25.json", *input_data.extra_files]
     manifest.checksums = compute_checksums(out_root, checksum_targets)
     manifest_path = out_root / "manifest.json"
     write_manifest(manifest, manifest_path)
@@ -558,6 +794,11 @@ def materialize_packet(input_data: PacketMaterializationInput) -> PacketManifest
     if input_data.archive:
         archive_path = _archive_packet_dir(out_root, input_data.archive_format)
         print(f"[write] archive -> {archive_path}")
+
+    if all_skipped_ids:
+        print(f"[warn] {len(all_skipped_ids)} chunk(s) permanently skipped during embedding:")
+        for sid in all_skipped_ids:
+            print(f"[warn]   {sid}")
 
     print("[done] build ok")
     return manifest
@@ -709,13 +950,13 @@ class DefaultBuilder(CPMAbstractBuilder):
             raise ValueError("destination path must be provided")
 
         out_root = Path(destination).resolve()
-        print(f"[build] input_dir  = {source_path}")
-        print(f"[build] output_dir = {out_root}")
+        print(f"[build] input_dir      = {source_path}")
+        print(f"[build] output_dir     = {out_root}")
+        print(f"[build] max_chunk_size = {self.config.max_chunk_size} non-ws chars")
 
         chunks, ext_counts, files_indexed = _scan_source(
             source_path,
-            lines_per_chunk=self.config.lines_per_chunk,
-            overlap_lines=self.config.overlap_lines,
+            max_chunk_size=self.config.max_chunk_size,
         )
         print(f"[scan] files_indexed={files_indexed}")
         print(f"[scan] chunks_total={len(chunks)}")

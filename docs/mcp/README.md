@@ -11,8 +11,8 @@ This section documents MCP tooling exposed by `cpm mcp:serve`.
 
 ## Read Next
 
+- `docs/mcp/quickstart.md` — start server and connect Claude Desktop / Claude Code / Codex / VS Code
 - `docs/mcp/config.md`
-- `docs/mcp/quickstart.md`
 - `docs/mcp/tools/lookup.md`
 - `docs/mcp/tools/query.md`
 - `docs/mcp/tools/plan_from_intent.md`

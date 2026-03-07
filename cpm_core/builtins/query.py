@@ -14,7 +14,7 @@ from typing import Any, Iterable, Protocol
 from cpm_builtin.embeddings import EmbeddingClient, EmbeddingsConfigService
 from cpm_builtin.packages import PackageManager, parse_package_spec
 from cpm_builtin.packages.layout import version_dir
-from cpm_core.api import CPMAbstractRetriever, cpmcommand, cpmretriever
+from cpm_core.api import CPMAbstractRetriever, cpmcommand, cpmindexer, cpmreranker, cpmretriever
 from cpm_core.hub import HubClient, load_hub_settings
 from cpm_core.oci import read_install_lock, read_install_lock_as_of, write_install_lock
 from cpm_core.policy import evaluate_policy, load_policy
@@ -27,7 +27,7 @@ DEFAULT_RETRIEVER = "native-retriever"
 _CONFIG_RETRIEVER_KEYS = ("retriever", "query_retriever", "default_retriever")
 DEFAULT_EMBED_URL = "http://127.0.0.1:8876"
 DEFAULT_EMBED_MODE = "http"
-DEFAULT_INDEXER = "faiss-flatip"
+DEFAULT_INDEXER = "hybrid-rrf"
 HYBRID_INDEXER = "hybrid-rrf"
 DEFAULT_RERANKER = "none"
 
@@ -42,17 +42,25 @@ class RetrievalReranker(Protocol):
         ...
 
 
+@cpmindexer(name="faiss-flatip", group="cpm")
 class FaissFlatIPIndexer:
     def search(self, *, index: Any, vector: Any, k: int) -> tuple[Any, Any]:
         return index.search(vector, max(int(k), 1))
 
 
+@cpmindexer(name="hybrid-rrf", group="cpm")
+class HybridRRFIndexer(FaissFlatIPIndexer):
+    """Indexer placeholder for the hybrid RRF path (dense search + BM25 fused in retrieve())."""
+
+
+@cpmreranker(name="none", group="cpm")
 class NoopReranker:
     def rerank(self, *, query: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
         del query
         return hits[: max(int(k), 1)]
 
 
+@cpmreranker(name="token-diversity", group="cpm")
 class TokenDiversityReranker:
     def rerank(self, *, query: str, hits: list[dict[str, Any]], k: int) -> list[dict[str, Any]]:
         del query
@@ -82,22 +90,48 @@ class TokenDiversityReranker:
         return chosen
 
 
-_INDEXERS: dict[str, RetrievalIndexer] = {
-    DEFAULT_INDEXER: FaissFlatIPIndexer(),
-    HYBRID_INDEXER: FaissFlatIPIndexer(),
-}
-_RERANKERS: dict[str, RetrievalReranker] = {
-    DEFAULT_RERANKER: NoopReranker(),
-    "token-diversity": TokenDiversityReranker(),
-}
+def _build_builtin_registry() -> FeatureRegistry:
+    """Populate a FeatureRegistry with all built-in indexers and rerankers."""
+    from cpm_core.build.reranker import CrossEncoderReranker
+
+    registry = FeatureRegistry()
+    for cls in (FaissFlatIPIndexer, HybridRRFIndexer, NoopReranker, TokenDiversityReranker, CrossEncoderReranker):
+        meta = getattr(cls, "__cpm_feature__", None)
+        if meta is None:
+            continue
+        registry.register(
+            CPMRegistryEntry(
+                group=str(meta["group"]),
+                name=str(meta["name"]),
+                target=cls,
+                kind=str(meta["kind"]),
+                origin="builtin",
+            )
+        )
+    return registry
 
 
-def register_retriever_indexer(name: str, indexer: RetrievalIndexer) -> None:
-    _INDEXERS[str(name).strip()] = indexer
+_BUILTIN_REGISTRY: FeatureRegistry = _build_builtin_registry()
 
 
-def register_retriever_reranker(name: str, reranker: RetrievalReranker) -> None:
-    _RERANKERS[str(name).strip()] = reranker
+def register_retriever_indexer(name: str, indexer_cls: type) -> None:
+    """Register a custom indexer class under ``name`` (simple or ``group:name``)."""
+    meta = getattr(indexer_cls, "__cpm_feature__", None)
+    group = str(meta["group"]) if meta else "cpm"
+    reg_name = str(name).strip()
+    _BUILTIN_REGISTRY.register(
+        CPMRegistryEntry(group=group, name=reg_name, target=indexer_cls, kind="indexer", origin="external")
+    )
+
+
+def register_retriever_reranker(name: str, reranker_cls: type) -> None:
+    """Register a custom reranker class under ``name`` (simple or ``group:name``)."""
+    meta = getattr(reranker_cls, "__cpm_feature__", None)
+    group = str(meta["group"]) if meta else "cpm"
+    reg_name = str(name).strip()
+    _BUILTIN_REGISTRY.register(
+        CPMRegistryEntry(group=group, name=reg_name, target=reranker_cls, kind="reranker", origin="external")
+    )
 
 
 @cpmretriever(name=DEFAULT_RETRIEVER, group="cpm")
@@ -115,22 +149,28 @@ class NativeFaissRetriever(CPMAbstractRetriever):
         embed_mode = str(kwargs.get("embed_mode") or os.environ.get("RAG_EMBED_MODE") or DEFAULT_EMBED_MODE)
         indexer_name = str(kwargs.get("indexer") or DEFAULT_INDEXER).strip()
         reranker_name = str(kwargs.get("reranker") or DEFAULT_RERANKER).strip()
-        indexer = _INDEXERS.get(indexer_name)
-        reranker = _RERANKERS.get(reranker_name)
-        if indexer is None:
+        indexer_entry = _BUILTIN_REGISTRY.get(indexer_name, kind="indexer")
+        reranker_entry = _BUILTIN_REGISTRY.get(reranker_name, kind="reranker")
+        if indexer_entry is None:
             return {
                 "ok": False,
                 "error": "invalid_indexer",
                 "detail": f"indexer '{indexer_name}' is not registered",
-                "available_indexers": sorted(_INDEXERS.keys()),
+                "available_indexers": sorted(
+                    e.qualified_name for e in _BUILTIN_REGISTRY.entries() if e.kind == "indexer"
+                ),
             }
-        if reranker is None:
+        if reranker_entry is None:
             return {
                 "ok": False,
                 "error": "invalid_reranker",
                 "detail": f"reranker '{reranker_name}' is not registered",
-                "available_rerankers": sorted(_RERANKERS.keys()),
+                "available_rerankers": sorted(
+                    e.qualified_name for e in _BUILTIN_REGISTRY.entries() if e.kind == "reranker"
+                ),
             }
+        indexer = indexer_entry.target()
+        reranker = reranker_entry.target()
         packet_dir = self._resolve_packet_dir(cpm_dir, packet)
         if packet_dir is None:
             return {

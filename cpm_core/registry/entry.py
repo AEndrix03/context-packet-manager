@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Type
 
+VALID_KINDS: frozenset[str] = frozenset({"builder", "retriever", "command", "reranker", "indexer"})
+
 
 @dataclass(frozen=True)
 class CPMRegistryEntry:
@@ -21,6 +23,8 @@ class CPMRegistryEntry:
         object.__setattr__(self, "name", self._validate_component("name", self.name))
         object.__setattr__(self, "kind", self._validate_component("kind", self.kind))
         object.__setattr__(self, "origin", self._validate_component("origin", self.origin))
+        if self.kind not in VALID_KINDS:
+            raise ValueError(f"kind must be one of {sorted(VALID_KINDS)}, got '{self.kind}'.")
         if not isinstance(self.target, type):
             raise TypeError("target must be a class type.")
 

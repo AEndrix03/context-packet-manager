@@ -1,0 +1,31 @@
+# .cpmignore — skip non-source content during CPM build
+# Note: dist/, .venv/, __pycache__, .idea/, .pytest_cache/ etc. are already
+# excluded by the built-in SKIP_DIRS in ast_chunker — no need to repeat them.
+
+# ── CPM workspace (cache, state, installed packages) ────────────────────────
+.cpm/
+
+# ── Temporary / scratch directories ─────────────────────────────────────────
+temp/
+tmp_workspace/
+.tmp_build_llm/
+.tmp_conflict/
+.tmp-docker-config/
+
+# ── Agent and tool state ─────────────────────────────────────────────────────
+.claude/
+.serena/
+
+# ── Tests (not needed in the packet) ─────────────────────────────────────────
+tests/
+test_refactored_plugin.py
+
+# ── Build metadata / distribution artifacts ───────────────────────────────────
+cpm.egg-info/
+*.egg-info/
+
+# ── Reports (analysis output, not source) ────────────────────────────────────
+reports/
+
+# ── Log files ─────────────────────────────────────────────────────────────────
+*.log

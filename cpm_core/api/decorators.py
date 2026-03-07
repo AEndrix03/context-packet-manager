@@ -64,3 +64,19 @@ def _feature_decorator(
 cpmcommand = _feature_decorator(CPMAbstractCommand, "command")
 cpmbuilder = _feature_decorator(CPMAbstractBuilder, "builder")
 cpmretriever = _feature_decorator(CPMAbstractRetriever, "retriever")
+
+
+def _simple_feature_decorator(kind: str) -> Callable[..., Callable[[_FeatureCandidate], _FeatureCandidate]]:
+    """Return a decorator factory for protocol-based features (no ABC check)."""
+
+    def factory(*, name: str, group: str = "cpm") -> Callable[[_FeatureCandidate], _FeatureCandidate]:
+        def decorator(cls: _FeatureCandidate) -> _FeatureCandidate:
+            return _attach_feature_metadata(cls, kind, name=name, group=group)
+
+        return decorator
+
+    return factory
+
+
+cpmreranker = _simple_feature_decorator("reranker")
+cpmindexer = _simple_feature_decorator("indexer")

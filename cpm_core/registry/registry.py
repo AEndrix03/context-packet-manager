@@ -61,6 +61,35 @@ class FeatureRegistry:
             formatted.extend(qualified)
         return tuple(formatted)
 
+    def get(
+        self,
+        name_or_qualified: str | None = None,
+        *,
+        group: str | None = None,
+        name: str | None = None,
+        kind: str | None = None,
+    ) -> CPMRegistryEntry | None:
+        """Return an entry or ``None`` if not found.
+
+        Accepts either a positional ``name_or_qualified`` string (simple name or
+        ``group:name``) or explicit ``group``/``name`` keyword arguments.
+        Optionally filters by ``kind`` — returns ``None`` when the kind does not
+        match.
+        """
+        if group and name:
+            lookup = f"{group}:{name}"
+        elif name_or_qualified:
+            lookup = name_or_qualified
+        else:
+            return None
+        try:
+            entry = self.resolve(lookup)
+        except (FeatureNotFoundError, AmbiguousFeatureError):
+            return None
+        if kind is not None and entry.kind != kind:
+            return None
+        return entry
+
     def entries(self) -> tuple[CPMRegistryEntry, ...]:
         """Return all registered entries in qualified order."""
 

@@ -15,6 +15,7 @@ dependencies = [
     "requests>=2.30",
     "PyYAML>=6.0",
     "mcp>=1.26,<2",
+    "tree-sitter-languages>=0.1",
 ]
 keywords = ["cpm", "rag", "plugin", "cli"]
 authors = [
@@ -23,6 +24,7 @@ authors = [
 
 [project.optional-dependencies]
 dev = ["black>=24.0", "ruff>=0.0", "mypy>=1.9", "pytest>=7.3"]
+rerank = ["sentence-transformers>=2.7"]
 
 [project.entry-points.console_scripts]
 cpm = "cpm_cli.__main__:main"

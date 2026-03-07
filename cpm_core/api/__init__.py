@@ -1,7 +1,7 @@
 """Convenience imports for CPM API helpers."""
 
 from .abc import CPMAbstractBuilder, CPMAbstractCommand, CPMAbstractRetriever
-from .decorators import cpmcommand, cpmbuilder, cpmretriever
+from .decorators import cpmcommand, cpmbuilder, cpmretriever, cpmreranker, cpmindexer
 
 __all__ = [
     "CPMAbstractCommand",
@@ -10,4 +10,6 @@ __all__ = [
     "cpmcommand",
     "cpmbuilder",
     "cpmretriever",
+    "cpmreranker",
+    "cpmindexer",
 ]
