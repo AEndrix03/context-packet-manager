@@ -438,6 +438,12 @@ class QueryCommand(_WorkspaceAwareCommand):
             help="Embedding model override for query-time embedding",
         )
         parser.add_argument("--max-context-tokens", type=int, default=6000, help="Context compiler token cap")
+        parser.add_argument(
+            "--no-verify",
+            action="store_true",
+            default=False,
+            help="Disable OCI signature/SBOM/provenance verification (useful for local/dev registries)",
+        )
         parser.add_argument("--replay-log", help="Write deterministic replay log to this path")
         parser.add_argument("--embed-url", help="Embedding server URL override")
         parser.add_argument(
@@ -456,6 +462,12 @@ class QueryCommand(_WorkspaceAwareCommand):
         requested_dir = getattr(argv, "workspace_dir", None)
         workspace_root = self._resolve(requested_dir)
         self.workspace_root = workspace_root
+        no_verify = bool(getattr(argv, "no_verify", False))
+        oci_config_overrides: dict[str, Any] = (
+            {"strict_verify": False, "require_signature": False, "require_sbom": False, "require_provenance": False}
+            if no_verify
+            else {}
+        )
         policy = load_policy(workspace_root)
         hub_client = HubClient(load_hub_settings(workspace_root))
 
@@ -490,7 +502,9 @@ class QueryCommand(_WorkspaceAwareCommand):
                 print(f"[cpm:query] hub policy deny source={source_uri} reason={reason}")
                 return 1
             try:
-                reference, local_packet = SourceResolver(workspace_root).resolve_and_fetch(source_uri)
+                reference, local_packet = SourceResolver(
+                    workspace_root, oci_config_overrides=oci_config_overrides
+                ).resolve_and_fetch(source_uri)
             except Exception as exc:
                 print(f"[cpm:query] unable to materialize source '{source_uri}': {exc}")
                 if source_uri.startswith("oci://") and packet_name and "@" not in packet_name and ":" not in packet_name:
@@ -922,8 +936,22 @@ class QueryCommand(_WorkspaceAwareCommand):
             return ""
         value = registry.strip()
         if value.startswith("oci://"):
-            if packet and value.startswith("oci://") and "@" not in value.split("/")[-1] and ":" not in value.split("/")[-1]:
-                return f"{value.rstrip('/')}/{packet}"
+            if packet:
+                # Strip the oci:// scheme and isolate the authority (host[:port]).
+                # A bare registry reference has no '/' after the authority, so we
+                # always append the packet.  A reference that already includes a
+                # path-level tag (':tag') or digest ('@sha256:') is used as-is.
+                after_scheme = value[len("oci://"):]
+                # authority is up to the first slash; path is everything after
+                first_slash = after_scheme.find("/")
+                if first_slash == -1:
+                    # bare host (possibly host:port) — always append packet
+                    return f"{value.rstrip('/')}/{packet}"
+                path_part = after_scheme[first_slash:]
+                last_segment = path_part.rstrip("/").rsplit("/", 1)[-1]
+                already_tagged = (":" in last_segment) or ("@" in last_segment)
+                if not already_tagged:
+                    return f"{value.rstrip('/')}/{packet}"
             return value
         if value.startswith(("http://", "https://", "dir://")):
             raise ValueError("only OCI registry references are supported; use oci://... or <registry>/<repo>")

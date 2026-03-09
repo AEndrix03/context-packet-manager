@@ -41,14 +41,21 @@ def _load_oci_config(workspace_root: Path) -> dict[str, object]:
 
 
 class OciSource:
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(self, workspace_root: Path, *, oci_config_overrides: dict[str, Any] | None = None) -> None:
         self.workspace_root = workspace_root.resolve()
+        self._oci_config_overrides: dict[str, Any] = dict(oci_config_overrides or {})
 
     def can_handle(self, uri: str) -> bool:
         return uri.startswith("oci://")
 
+    def _effective_config(self) -> dict[str, Any]:
+        base = _load_oci_config(self.workspace_root)
+        if self._oci_config_overrides:
+            base = {**base, **self._oci_config_overrides}
+        return base
+
     def _client(self) -> OciClient:
-        config = _load_oci_config(self.workspace_root)
+        config = self._effective_config()
         # Resolver calls back MCP lookup/query and should fail fast on network issues.
         timeout_seconds = float(config.get("timeout_seconds", 10.0))
         max_retries = int(config.get("max_retries", 1))
@@ -90,7 +97,7 @@ class OciSource:
         return raw
 
     def _verify(self, client: OciClient, ref: str, digest: str) -> dict[str, Any]:
-        verification_cfg = _load_oci_config(self.workspace_root)
+        verification_cfg = self._effective_config()
         strict = bool(verification_cfg.get("strict_verify", True))
         report = evaluate_trust_report(
             client.discover_referrers(f"{ref.split('@', 1)[0]}@{digest}"),
@@ -208,10 +215,10 @@ class OciSource:
 
 
 class SourceResolver:
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(self, workspace_root: Path, *, oci_config_overrides: dict[str, Any] | None = None) -> None:
         self.workspace_root = workspace_root.resolve()
         self.cache = SourceCache(self.workspace_root)
-        self._source: CPMSource = OciSource(self.workspace_root)
+        self._source: CPMSource = OciSource(self.workspace_root, oci_config_overrides=oci_config_overrides)
 
     def resolve_and_fetch(self, uri: str) -> tuple[PacketReference, LocalPacket]:
         if not self._source.can_handle(uri):
